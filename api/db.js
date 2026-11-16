@@ -52,13 +52,19 @@ export const db = {
 // In-Memory Cache Partitioned By Center (Zero Row Reads on Cache Hit)
 // ==============================================================================
 let inMemoryCache = {}; // centerName -> { data, expiresAt }
+let centersCache = null; // { data, expiresAt }
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes TTL
+
+export function invalidateCentersCache() {
+  centersCache = null;
+}
 
 export function invalidateCache(center = null) {
   if (center && typeof center === 'string') {
     delete inMemoryCache[center.trim()];
   } else {
     inMemoryCache = {};
+    centersCache = null;
   }
 }
 
@@ -103,168 +109,187 @@ export function computeUniqueCategories(settings = [], employees = []) {
   return uniqueCategories;
 }
 
+let migrationDone = false;
+let migrationPromise = null;
+
 /**
- * Automatically creates tables if they don't exist, defines mandatory indexes,
+ * Automatically creates tables if they don't exist, defines mandatory composite indexes,
  * and migrates schema to support multi-tenant Centers isolation.
+ * Runs only once per server/serverless instance to avoid repeated Turso row reads.
  */
 export async function createTablesAndMigrate() {
-  try {
-    // 1. Create Centers Table
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS Training_Centers (
-        ID TEXT PRIMARY KEY,
-        Name TEXT UNIQUE NOT NULL,
-        CreatedAt TEXT
-      );
-    `);
+  if (migrationDone) return;
+  if (migrationPromise) return migrationPromise;
 
-    // 2. Create tables with exact names matching application schema
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS Training_Employees (
-        ID TEXT PRIMARY KEY,
-        Name TEXT NOT NULL,
-        Job TEXT,
-        Category TEXT NOT NULL,
-        Center TEXT
-      );
-    `);
+  migrationPromise = (async () => {
+    try {
+      // 1. Create Tables
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS Training_Centers (
+          ID TEXT PRIMARY KEY,
+          Name TEXT UNIQUE NOT NULL,
+          CreatedAt TEXT
+        );
+      `);
 
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS Training_TrainingLogs (
-        ID TEXT PRIMARY KEY,
-        Date TEXT NOT NULL,
-        Month INTEGER,
-        Year INTEGER,
-        Category TEXT NOT NULL,
-        Policies TEXT NOT NULL,
-        TraineeName TEXT NOT NULL,
-        Trainer TEXT NOT NULL,
-        Timestamp TEXT NOT NULL,
-        Center TEXT
-      );
-    `);
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS Training_Employees (
+          ID TEXT PRIMARY KEY,
+          Name TEXT NOT NULL,
+          Job TEXT,
+          Category TEXT NOT NULL,
+          Center TEXT
+        );
+      `);
 
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS Training_Settings (
-        Type TEXT NOT NULL,
-        Value TEXT NOT NULL,
-        Center TEXT
-      );
-    `);
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS Training_TrainingLogs (
+          ID TEXT PRIMARY KEY,
+          Date TEXT NOT NULL,
+          Month INTEGER,
+          Year INTEGER,
+          Category TEXT NOT NULL,
+          Policies TEXT NOT NULL,
+          TraineeName TEXT NOT NULL,
+          Trainer TEXT NOT NULL,
+          Timestamp TEXT NOT NULL,
+          Center TEXT
+        );
+      `);
 
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS Training_TrainingPlan (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        Month TEXT NOT NULL,
-        Category TEXT NOT NULL,
-        Policies TEXT NOT NULL,
-        Year TEXT NOT NULL,
-        Center TEXT
-      );
-    `);
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS Training_Settings (
+          Type TEXT NOT NULL,
+          Value TEXT NOT NULL,
+          Center TEXT
+        );
+      `);
 
-    // Ensure Center column exists if tables were created in an older schema
-    const alterQueries = [
-      "ALTER TABLE Training_Employees ADD COLUMN Center TEXT;",
-      "ALTER TABLE Training_TrainingLogs ADD COLUMN Center TEXT;",
-      "ALTER TABLE Training_Settings ADD COLUMN Center TEXT;",
-      "ALTER TABLE Training_TrainingPlan ADD COLUMN Center TEXT;",
-      "ALTER TABLE Training_TrainingPlan ADD COLUMN Year TEXT;"
-    ];
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS Training_TrainingPlan (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          Month TEXT NOT NULL,
+          Category TEXT NOT NULL,
+          Policies TEXT NOT NULL,
+          Year TEXT NOT NULL,
+          Center TEXT
+        );
+      `);
 
-    for (const q of alterQueries) {
-      try {
-        await db.execute(q);
-      } catch (e) {
-        // Column already exists
-      }
-    }
-
-    // Indexes for high performance
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_centers_name ON Training_Centers (Name);`);
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_emp_center ON Training_Employees (Center);`);
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_emp_category ON Training_Employees (Category);`);
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_emp_name ON Training_Employees (Name);`);
-
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_logs_center ON Training_TrainingLogs (Center);`);
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_logs_date ON Training_TrainingLogs (Date);`);
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_logs_year_month ON Training_TrainingLogs (Year, Month);`);
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_logs_category ON Training_TrainingLogs (Category);`);
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_logs_trainer ON Training_TrainingLogs (Trainer);`);
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_logs_trainee ON Training_TrainingLogs (TraineeName);`);
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_logs_session ON Training_TrainingLogs (Date, Category, Policies, Trainer);`);
-
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_settings_center ON Training_Settings (Center);`);
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_settings_type ON Training_Settings (Type);`);
-
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_plan_center ON Training_TrainingPlan (Center);`);
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_plan_lookup ON Training_TrainingPlan (Year, Month, Category);`);
-    await db.execute(`CREATE INDEX IF NOT EXISTS idx_plan_year ON Training_TrainingPlan (Year);`);
-
-    // 3. Ensure at least one default center exists and backfill rows
-    const centersCountRes = await db.execute("SELECT COUNT(*) as count FROM Training_Centers;");
-    const centersCount = Number(centersCountRes.rows[0]?.count || 0);
-
-    if (centersCount === 0) {
-      let defaultCenterName = "مستشفى المنيا الجامعى للعيون";
-      try {
-        const sRes = await db.execute("SELECT Value FROM Training_Settings WHERE Type = 'Hospital_Name' LIMIT 1;");
-        if (sRes.rows[0]?.Value && String(sRes.rows[0].Value).trim()) {
-          defaultCenterName = String(sRes.rows[0].Value).trim();
-        }
-      } catch (e) {}
-
-      const id = Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
-      await db.execute({
-        sql: "INSERT INTO Training_Centers (ID, Name, CreatedAt) VALUES (?, ?, ?);",
-        args: [id, defaultCenterName, new Date().toISOString()]
-      });
-
-      // Backfill existing rows without a center
-      await db.execute({
-        sql: "UPDATE Training_Employees SET Center = ? WHERE Center IS NULL OR TRIM(Center) = '';",
-        args: [defaultCenterName]
-      });
-      await db.execute({
-        sql: "UPDATE Training_TrainingLogs SET Center = ? WHERE Center IS NULL OR TRIM(Center) = '';",
-        args: [defaultCenterName]
-      });
-      await db.execute({
-        sql: "UPDATE Training_Settings SET Center = ? WHERE Center IS NULL OR TRIM(Center) = '';",
-        args: [defaultCenterName]
-      });
-      await db.execute({
-        sql: "UPDATE Training_TrainingPlan SET Center = ? WHERE Center IS NULL OR TRIM(Center) = '';",
-        args: [defaultCenterName]
-      });
-    }
-
-    // 4. Check if settings table is empty for the first center to trigger initial seed
-    const settingsCountResult = await db.execute("SELECT COUNT(*) as count FROM Training_Settings;");
-    const count = settingsCountResult.rows[0]?.count || 0;
-
-    if (Number(count) === 0) {
-      const defaultCenterName = await getDefaultCenterDb();
-      const defaultSettings = [
-        ["Hospital_Name", defaultCenterName],
-        ["Policy", "غسل الأيدي"],
-        ["Trainer", "مدرب مكافحة العدوى"],
-        ["Category", "تمريض"],
-        ["Category", "أطباء"],
-        ["Category", "عمال"],
-        ["Category", "إداريين"]
+      // Ensure Center & Year columns exist if tables were created in an older schema
+      const alterQueries = [
+        "ALTER TABLE Training_Employees ADD COLUMN Center TEXT;",
+        "ALTER TABLE Training_TrainingLogs ADD COLUMN Center TEXT;",
+        "ALTER TABLE Training_Settings ADD COLUMN Center TEXT;",
+        "ALTER TABLE Training_TrainingPlan ADD COLUMN Center TEXT;",
+        "ALTER TABLE Training_TrainingPlan ADD COLUMN Year TEXT;"
       ];
 
-      for (const [type, val] of defaultSettings) {
+      for (const q of alterQueries) {
+        try {
+          await db.execute(q);
+        } catch (e) {
+          // Column already exists
+        }
+      }
+
+      // 2. Mandatory Single & Composite Indexes (Center-leading for Search Instead of Scan)
+      const indexQueries = [
+        `CREATE INDEX IF NOT EXISTS idx_centers_name ON Training_Centers (Name);`,
+        `CREATE INDEX IF NOT EXISTS idx_emp_center ON Training_Employees (Center);`,
+        `CREATE INDEX IF NOT EXISTS idx_emp_center_cat ON Training_Employees (Center, Category);`,
+        `CREATE INDEX IF NOT EXISTS idx_emp_center_name ON Training_Employees (Center, Name);`,
+        `CREATE INDEX IF NOT EXISTS idx_emp_category ON Training_Employees (Category);`,
+        `CREATE INDEX IF NOT EXISTS idx_emp_name ON Training_Employees (Name);`,
+
+        `CREATE INDEX IF NOT EXISTS idx_logs_center ON Training_TrainingLogs (Center);`,
+        `CREATE INDEX IF NOT EXISTS idx_logs_center_date ON Training_TrainingLogs (Center, Date);`,
+        `CREATE INDEX IF NOT EXISTS idx_logs_center_ym ON Training_TrainingLogs (Center, Year, Month);`,
+        `CREATE INDEX IF NOT EXISTS idx_logs_center_cat ON Training_TrainingLogs (Center, Category);`,
+        `CREATE INDEX IF NOT EXISTS idx_logs_center_trainer ON Training_TrainingLogs (Center, Trainer);`,
+        `CREATE INDEX IF NOT EXISTS idx_logs_center_trainee ON Training_TrainingLogs (Center, TraineeName);`,
+        `CREATE INDEX IF NOT EXISTS idx_logs_center_session ON Training_TrainingLogs (Center, Date, Category, Policies, Trainer);`,
+        `CREATE INDEX IF NOT EXISTS idx_logs_date ON Training_TrainingLogs (Date);`,
+        `CREATE INDEX IF NOT EXISTS idx_logs_year_month ON Training_TrainingLogs (Year, Month);`,
+        `CREATE INDEX IF NOT EXISTS idx_logs_category ON Training_TrainingLogs (Category);`,
+        `CREATE INDEX IF NOT EXISTS idx_logs_trainer ON Training_TrainingLogs (Trainer);`,
+        `CREATE INDEX IF NOT EXISTS idx_logs_trainee ON Training_TrainingLogs (TraineeName);`,
+        `CREATE INDEX IF NOT EXISTS idx_logs_session ON Training_TrainingLogs (Date, Category, Policies, Trainer);`,
+
+        `CREATE INDEX IF NOT EXISTS idx_settings_center ON Training_Settings (Center);`,
+        `CREATE INDEX IF NOT EXISTS idx_settings_center_type ON Training_Settings (Center, Type, Value);`,
+        `CREATE INDEX IF NOT EXISTS idx_settings_type ON Training_Settings (Type);`,
+
+        `CREATE INDEX IF NOT EXISTS idx_plan_center ON Training_TrainingPlan (Center);`,
+        `CREATE INDEX IF NOT EXISTS idx_plan_center_lookup ON Training_TrainingPlan (Center, Year, Category, Month);`,
+        `CREATE INDEX IF NOT EXISTS idx_plan_lookup ON Training_TrainingPlan (Year, Month, Category);`,
+        `CREATE INDEX IF NOT EXISTS idx_plan_year ON Training_TrainingPlan (Year);`
+      ];
+
+      await db.batch(indexQueries, "write");
+
+      // 3. Ensure at least one default center exists and backfill any NULL/empty Center rows using indexed lookups
+      const centersRes = await db.execute("SELECT Name FROM Training_Centers ORDER BY CreatedAt ASC LIMIT 1;");
+      let defaultCenterName = centersRes.rows[0]?.Name ? String(centersRes.rows[0].Name).trim() : "";
+
+      if (!defaultCenterName) {
+        defaultCenterName = "مستشفى المنيا الجامعى للعيون";
+        try {
+          const sRes = await db.execute("SELECT Value FROM Training_Settings WHERE Type = 'Hospital_Name' LIMIT 1;");
+          if (sRes.rows[0]?.Value && String(sRes.rows[0].Value).trim()) {
+            defaultCenterName = String(sRes.rows[0].Value).trim();
+          }
+        } catch (e) {}
+
+        const id = Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
         await db.execute({
-          sql: "INSERT INTO Training_Settings (Type, Value, Center) VALUES (?, ?, ?)",
-          args: [type, val, defaultCenterName]
+          sql: "INSERT INTO Training_Centers (ID, Name, CreatedAt) VALUES (?, ?, ?);",
+          args: [id, defaultCenterName, new Date().toISOString()]
         });
       }
+
+      // Indexed backfill ONLY for rows where Center IS NULL or '' (O(1) via idx_*_center if none exist)
+      await db.batch([
+        { sql: "UPDATE Training_Employees SET Center = ? WHERE Center IS NULL OR Center = '';", args: [defaultCenterName] },
+        { sql: "UPDATE Training_TrainingLogs SET Center = ? WHERE Center IS NULL OR Center = '';", args: [defaultCenterName] },
+        { sql: "UPDATE Training_Settings SET Center = ? WHERE Center IS NULL OR Center = '';", args: [defaultCenterName] },
+        { sql: "UPDATE Training_TrainingPlan SET Center = ? WHERE Center IS NULL OR Center = '';", args: [defaultCenterName] }
+      ], "write");
+
+      // 4. Check if settings table has any rows for default center to trigger initial seed
+      const settingsCheckResult = await db.execute({
+        sql: "SELECT 1 FROM Training_Settings WHERE Center = ? LIMIT 1;",
+        args: [defaultCenterName]
+      });
+
+      if (settingsCheckResult.rows.length === 0) {
+        const defaultSettings = [
+          ["Hospital_Name", defaultCenterName],
+          ["Policy", "غسل الأيدي"],
+          ["Trainer", "مدرب مكافحة العدوى"],
+          ["Category", "تمريض"],
+          ["Category", "أطباء"],
+          ["Category", "عمال"],
+          ["Category", "إداريين"]
+        ];
+
+        await db.batch(
+          defaultSettings.map(([type, val]) => ({
+            sql: "INSERT INTO Training_Settings (Type, Value, Center) VALUES (?, ?, ?)",
+            args: [type, val, defaultCenterName]
+          })),
+          "write"
+        );
+      }
+
+      migrationDone = true;
+    } catch (err) {
+      migrationPromise = null;
+      console.error("فشل في تهيئة قاعدة البيانات في Turso:", err);
     }
-  } catch (err) {
-    console.error("فشل في تهيئة قاعدة البيانات في Turso:", err);
-  }
+  })();
+
+  return migrationPromise;
 }
 
 /**
@@ -358,40 +383,61 @@ export async function getDefaultCenterDb() {
 }
 
 /**
- * Fetches all registered centers with their employee & log counts
+ * Fetches all registered centers with their employee & session counts.
+ * Uses In-Memory Cache and covering index GROUP BY queries (no full table scans).
  */
-export async function getCentersDb() {
+export async function getCentersDb(forceRefresh = false) {
+  if (!forceRefresh && centersCache && Date.now() < centersCache.expiresAt) {
+    return centersCache.data;
+  }
+
   await createTablesAndMigrate();
-  const centersRes = await db.execute("SELECT ID, Name, CreatedAt FROM Training_Centers ORDER BY CreatedAt ASC;");
+
+  const [centersRes, empCountsRes, sessionCountsRes] = await Promise.all([
+    db.execute("SELECT ID, Name, CreatedAt FROM Training_Centers ORDER BY CreatedAt ASC;"),
+    db.execute("SELECT Center, COUNT(*) as count FROM Training_Employees GROUP BY Center;"),
+    db.execute(`
+      SELECT Center, COUNT(*) as count
+      FROM (
+        SELECT Center, Date, Category, Policies, Trainer
+        FROM Training_TrainingLogs
+        GROUP BY Center, Date, Category, Policies, Trainer
+      )
+      GROUP BY Center;
+    `)
+  ]);
+
+  const empCountMap = new Map();
+  for (const r of empCountsRes.rows) {
+    const cName = String(r.Center || "").trim();
+    if (cName) empCountMap.set(cName, (empCountMap.get(cName) || 0) + Number(r.count || 0));
+  }
+
+  const sessionCountMap = new Map();
+  for (const r of sessionCountsRes.rows) {
+    const cName = String(r.Center || "").trim();
+    if (cName) sessionCountMap.set(cName, (sessionCountMap.get(cName) || 0) + Number(r.count || 0));
+  }
+
   const centers = [];
   for (const row of centersRes.rows) {
     const name = String(row.Name || "").trim();
     if (!name) continue;
 
-    let empCount = 0;
-    let logCount = 0;
-    try {
-      const eRes = await db.execute({
-        sql: "SELECT COUNT(*) as count FROM Training_Employees WHERE TRIM(Center) = TRIM(?);",
-        args: [name]
-      });
-      empCount = Number(eRes.rows[0]?.count || 0);
-
-      const lRes = await db.execute({
-        sql: "SELECT COUNT(DISTINCT Date || Category || Policies || Trainer) as count FROM Training_TrainingLogs WHERE TRIM(Center) = TRIM(?);",
-        args: [name]
-      });
-      logCount = Number(lRes.rows[0]?.count || 0);
-    } catch (e) {}
-
     centers.push({
       ID: String(row.ID || ""),
       Name: name,
       CreatedAt: String(row.CreatedAt || ""),
-      employeesCount: empCount,
-      sessionsCount: logCount
+      employeesCount: empCountMap.get(name) || 0,
+      sessionsCount: sessionCountMap.get(name) || 0
     });
   }
+
+  centersCache = {
+    data: centers,
+    expiresAt: Date.now() + CACHE_TTL_MS
+  };
+
   return centers;
 }
 
@@ -406,7 +452,7 @@ export async function addCenterDb(centerName) {
   await createTablesAndMigrate();
 
   const existing = await db.execute({
-    sql: "SELECT Name FROM Training_Centers WHERE TRIM(Name) = TRIM(?) LIMIT 1;",
+    sql: "SELECT Name FROM Training_Centers WHERE Name = ? LIMIT 1;",
     args: [cleanName]
   });
   if (existing.rows.length > 0) {
@@ -414,12 +460,6 @@ export async function addCenterDb(centerName) {
   }
 
   const id = Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
-  await db.execute({
-    sql: "INSERT INTO Training_Centers (ID, Name, CreatedAt) VALUES (?, ?, ?);",
-    args: [id, cleanName, new Date().toISOString()]
-  });
-
-  // Seed default settings for the new center
   const defaultSettings = [
     ["Hospital_Name", cleanName],
     ["Policy", "غسل الأيدي"],
@@ -429,15 +469,21 @@ export async function addCenterDb(centerName) {
     ["Category", "عمال"],
     ["Category", "إداريين"]
   ];
-  for (const [type, val] of defaultSettings) {
-    await db.execute({
+
+  await db.batch([
+    {
+      sql: "INSERT INTO Training_Centers (ID, Name, CreatedAt) VALUES (?, ?, ?);",
+      args: [id, cleanName, new Date().toISOString()]
+    },
+    ...defaultSettings.map(([type, val]) => ({
       sql: "INSERT INTO Training_Settings (Type, Value, Center) VALUES (?, ?, ?);",
       args: [type, val, cleanName]
-    });
-  }
+    }))
+  ], "write");
 
   invalidateCache(cleanName);
-  return getCentersDb();
+  invalidateCentersCache();
+  return getCentersDb(true);
 }
 
 /**
@@ -450,45 +496,23 @@ export async function deleteCenterDb(centerName) {
   const cleanName = String(centerName).trim();
   await createTablesAndMigrate();
 
-  // 1. Permanently delete all employees of this center
-  await db.execute({
-    sql: "DELETE FROM Training_Employees WHERE TRIM(Center) = TRIM(?) OR Center = ?",
-    args: [cleanName, cleanName]
-  });
+  await db.batch([
+    { sql: "DELETE FROM Training_Employees WHERE Center = ?;", args: [cleanName] },
+    { sql: "DELETE FROM Training_TrainingLogs WHERE Center = ?;", args: [cleanName] },
+    { sql: "DELETE FROM Training_TrainingPlan WHERE Center = ?;", args: [cleanName] },
+    { sql: "DELETE FROM Training_Settings WHERE Center = ?;", args: [cleanName] },
+    { sql: "DELETE FROM Training_Centers WHERE Name = ?;", args: [cleanName] }
+  ], "write");
 
-  // 2. Permanently delete all training logs of this center
-  await db.execute({
-    sql: "DELETE FROM Training_TrainingLogs WHERE TRIM(Center) = TRIM(?) OR Center = ?",
-    args: [cleanName, cleanName]
-  });
-
-  // 3. Permanently delete training plan of this center
-  await db.execute({
-    sql: "DELETE FROM Training_TrainingPlan WHERE TRIM(Center) = TRIM(?) OR Center = ?",
-    args: [cleanName, cleanName]
-  });
-
-  // 4. Permanently delete settings of this center
-  await db.execute({
-    sql: "DELETE FROM Training_Settings WHERE TRIM(Center) = TRIM(?) OR Center = ?",
-    args: [cleanName, cleanName]
-  });
-
-  // 5. Delete the center entry from Training_Centers
-  await db.execute({
-    sql: "DELETE FROM Training_Centers WHERE TRIM(Name) = TRIM(?) OR Name = ?",
-    args: [cleanName, cleanName]
-  });
-
-  // Invalidate in-memory cache
   invalidateCache(cleanName);
+  invalidateCentersCache();
 
-  return getCentersDb();
+  return getCentersDb(true);
 }
 
 /**
  * Fetches all database tables strictly isolated by Center.
- * Uses In-Memory Cache-Aside per center.
+ * Uses In-Memory Cache-Aside BEFORE touching the database (0 row reads on cache hit).
  */
 export async function getAllDataDb(options = {}) {
   let targetCenter = "";
@@ -501,17 +525,29 @@ export async function getAllDataDb(options = {}) {
     forceRefresh = !!options.forceRefresh;
   }
 
+  // Fast path: if both center data & centers list are cached, return immediately (0 Turso reads)
+  if (!forceRefresh && targetCenter && inMemoryCache[targetCenter] && Date.now() < inMemoryCache[targetCenter].expiresAt) {
+    const cachedCenters = centersCache && Date.now() < centersCache.expiresAt ? centersCache.data : await getCentersDb();
+    if (cachedCenters.some(c => c.Name === targetCenter)) {
+      return {
+        ...inMemoryCache[targetCenter].data,
+        centers: cachedCenters,
+        currentCenter: targetCenter
+      };
+    }
+  }
+
   await createTablesAndMigrate();
 
-  // Fetch available centers
-  const centersList = await getCentersDb();
+  // Fetch available centers (uses centersCache when valid)
+  const centersList = await getCentersDb(forceRefresh);
   const centerNames = centersList.map(c => c.Name);
 
   if (!targetCenter || !centerNames.includes(targetCenter)) {
     targetCenter = centerNames.length > 0 ? centerNames[0] : await getDefaultCenterDb();
   }
 
-  // 1. Check in-memory cache for this center (0 cloud row reads)
+  // Check in-memory cache again after resolving default targetCenter
   const cached = inMemoryCache[targetCenter];
   if (!forceRefresh && cached && Date.now() < cached.expiresAt) {
     return {
@@ -521,25 +557,23 @@ export async function getAllDataDb(options = {}) {
     };
   }
 
-  // 2. Query isolated data for this center
-  const defaultCenter = centerNames.length > 0 ? centerNames[0] : targetCenter;
-
+  // Query isolated data for this center using direct indexed equality (SEARCH ... USING INDEX)
   const [employeesResult, logsResult, settingsResult, planResult] = await Promise.all([
     db.execute({
-      sql: "SELECT ID, Name, Job, Category FROM Training_Employees WHERE TRIM(Center) = TRIM(?) OR (Center IS NULL AND ? = ?);",
-      args: [targetCenter, targetCenter, defaultCenter]
+      sql: "SELECT ID, Name, Job, Category FROM Training_Employees WHERE Center = ?;",
+      args: [targetCenter]
     }),
     db.execute({
-      sql: "SELECT ID, Date, Month, Year, Category, Policies, TraineeName, Trainer, Timestamp FROM Training_TrainingLogs WHERE TRIM(Center) = TRIM(?) OR (Center IS NULL AND ? = ?);",
-      args: [targetCenter, targetCenter, defaultCenter]
+      sql: "SELECT ID, Date, Month, Year, Category, Policies, TraineeName, Trainer, Timestamp FROM Training_TrainingLogs WHERE Center = ?;",
+      args: [targetCenter]
     }),
     db.execute({
-      sql: "SELECT Type, Value FROM Training_Settings WHERE TRIM(Center) = TRIM(?) OR (Center IS NULL AND ? = ?);",
-      args: [targetCenter, targetCenter, defaultCenter]
+      sql: "SELECT Type, Value FROM Training_Settings WHERE Center = ?;",
+      args: [targetCenter]
     }),
     db.execute({
-      sql: "SELECT rowid, Month, Category, Policies, Year FROM Training_TrainingPlan WHERE TRIM(Center) = TRIM(?) OR (Center IS NULL AND ? = ?);",
-      args: [targetCenter, targetCenter, defaultCenter]
+      sql: "SELECT rowid, Month, Category, Policies, Year FROM Training_TrainingPlan WHERE Center = ?;",
+      args: [targetCenter]
     })
   ]);
 
@@ -650,13 +684,13 @@ export async function saveTrainingSessionDb(data, centerArg = "") {
     }
   }
 
-  // Ensure trainer is added to settings for this center
+  // Ensure trainer is added to settings for this center (uses idx_settings_center_type)
   const cleanTrainer = data.trainer ? data.trainer.trim() : "";
   if (cleanTrainer) {
     try {
       const existing = await db.execute({
-        sql: "SELECT Value FROM Training_Settings WHERE Type = 'Trainer' AND TRIM(Value) = TRIM(?) AND TRIM(Center) = TRIM(?) LIMIT 1;",
-        args: [cleanTrainer, center]
+        sql: "SELECT Value FROM Training_Settings WHERE Center = ? AND Type = 'Trainer' AND Value = ? LIMIT 1;",
+        args: [center, cleanTrainer]
       });
       if (existing.rows.length === 0) {
         await db.execute({
@@ -667,7 +701,9 @@ export async function saveTrainingSessionDb(data, centerArg = "") {
     } catch (e) {}
   }
 
-  // Update in-memory cache
+  invalidateCentersCache();
+
+  // Update in-memory cache optimistically
   if (inMemoryCache[center]?.data) {
     inMemoryCache[center].data.logs.push(...newLogs);
     if (cleanTrainer && !inMemoryCache[center].data.settings.some(s => s.Type === 'Trainer' && String(s.Value).trim() === cleanTrainer)) {
@@ -703,23 +739,27 @@ export async function addTraineesToSessionDb(payload = {}, centerArg = "") {
   // 1. If any new employees were created on the fly, save them to Training_Employees with Center
   const addedEmployees = [];
   if (Array.isArray(newEmployees) && newEmployees.length > 0) {
+    const empBatch = [];
     for (const emp of newEmployees) {
       if (emp && emp.Name && String(emp.Name).trim()) {
         const empId = String(emp.ID || (Math.random().toString(36).substr(2, 9) + Date.now().toString(36)));
         const empName = String(emp.Name).trim();
         const empJob = String(emp.Job || "").trim() || "موظف";
         const empCat = String(emp.Category || cleanCat).trim();
-        
-        await db.execute({
+
+        empBatch.push({
           sql: `INSERT OR IGNORE INTO Training_Employees (ID, Name, Job, Category, Center) VALUES (?, ?, ?, ?, ?)`,
           args: sanitizeSqlArgs([empId, empName, empJob, empCat, center])
         });
         addedEmployees.push({ ID: empId, Name: empName, Job: empJob, Category: empCat });
       }
     }
+    if (empBatch.length > 0) {
+      await db.batch(empBatch, "write");
+    }
   }
 
-  // 2. Fetch existing trainee names in session for this center
+  // 2. Fetch existing trainee names in session for this center (uses idx_logs_center_date)
   const existingNamesInSession = new Set();
   let matchedSessionMonth = null;
   let matchedSessionYear = null;
@@ -741,8 +781,8 @@ export async function addTraineesToSessionDb(payload = {}, centerArg = "") {
   } else if (cleanDate && cleanCat) {
     const sessionCheck = await db.execute({
       sql: `SELECT Date, Month, Year, TraineeName, Policies, Trainer FROM Training_TrainingLogs 
-            WHERE Date = ? AND Category = ? AND (TRIM(Center) = TRIM(?) OR Center IS NULL) LIMIT 250`,
-      args: [rawDate || cleanDate, cleanCat, center]
+            WHERE Center = ? AND Date = ? AND Category = ? LIMIT 250`,
+      args: [center, rawDate || cleanDate, cleanCat]
     });
     for (const r of sessionCheck.rows) {
       if (String(r.Policies || "").trim() === cleanPol &&
@@ -814,6 +854,8 @@ export async function addTraineesToSessionDb(payload = {}, centerArg = "") {
     }
   }
 
+  invalidateCentersCache();
+
   if (inMemoryCache[center]?.data) {
     inMemoryCache[center].data.logs.push(...newLogs);
     if (addedEmployees.length > 0) {
@@ -844,40 +886,40 @@ export async function updateSessionTrainerDb(payload = {}, centerArg = "") {
   const cleanCat = category ? String(category).trim() : "";
   const cleanPol = policies ? String(policies).trim() : "";
 
-  // 1. Update by specific Log IDs if provided
+  // 1. Update by specific Log IDs if provided (uses PRIMARY KEY)
   if (Array.isArray(logIds) && logIds.length > 0) {
     const validIds = logIds.filter(Boolean);
     for (let i = 0; i < validIds.length; i += 50) {
       const chunk = validIds.slice(i, i + 50);
       const placeholders = chunk.map(() => '?').join(',');
       await db.execute({
-        sql: `UPDATE Training_TrainingLogs SET Trainer = ? WHERE ID IN (${placeholders}) AND (TRIM(Center) = TRIM(?) OR Center IS NULL)`,
+        sql: `UPDATE Training_TrainingLogs SET Trainer = ? WHERE ID IN (${placeholders}) AND Center = ?`,
         args: [cleanNewTrainer, ...chunk, center]
       });
     }
   }
 
-  // 2. Also update by session composite match
+  // 2. Also update by session composite match (uses idx_logs_center_cat)
   if (cleanDate && cleanCat && cleanPol) {
     let sql = `UPDATE Training_TrainingLogs 
                SET Trainer = ? 
-               WHERE (Date = ? OR Date LIKE ?) 
-                 AND TRIM(Category) = TRIM(?) 
-                 AND TRIM(Policies) = TRIM(?)
-                 AND (TRIM(Center) = TRIM(?) OR Center IS NULL)`;
-    const args = [cleanNewTrainer, cleanDate, `${cleanDate}%`, cleanCat, cleanPol, center];
+               WHERE Center = ? 
+                 AND Category = ? 
+                 AND Policies = ?
+                 AND (Date = ? OR Date LIKE ?)`;
+    const args = [cleanNewTrainer, center, cleanCat, cleanPol, cleanDate, `${cleanDate}%`];
     if (cleanOldTrainer) {
-      sql += ` AND TRIM(Trainer) = TRIM(?)`;
+      sql += ` AND Trainer = ?`;
       args.push(cleanOldTrainer);
     }
     await db.execute({ sql, args });
   }
 
-  // 3. Ensure the new trainer exists in Training_Settings for this center
+  // 3. Ensure the new trainer exists in Training_Settings for this center (uses idx_settings_center_type)
   try {
     const existing = await db.execute({
-      sql: "SELECT Value FROM Training_Settings WHERE Type = 'Trainer' AND TRIM(Value) = TRIM(?) AND (TRIM(Center) = TRIM(?) OR Center IS NULL) LIMIT 1",
-      args: [cleanNewTrainer, center]
+      sql: "SELECT Value FROM Training_Settings WHERE Center = ? AND Type = 'Trainer' AND Value = ? LIMIT 1",
+      args: [center, cleanNewTrainer]
     });
     if (existing.rows.length === 0) {
       await db.execute({
@@ -886,6 +928,8 @@ export async function updateSessionTrainerDb(payload = {}, centerArg = "") {
       });
     }
   } catch (err) {}
+
+  invalidateCentersCache();
 
   if (inMemoryCache[center]?.data) {
     const validIdsSet = new Set(Array.isArray(logIds) ? logIds.filter(Boolean).map(String) : []);
@@ -935,36 +979,36 @@ export async function updateSessionPoliciesDb(payload = {}, centerArg = "") {
   const cleanCat = category ? String(category).trim() : "";
   const cleanTrainer = trainer ? String(trainer).trim() : "";
 
-  // 1. Update by specific Log IDs if provided
+  // 1. Update by specific Log IDs if provided (uses PRIMARY KEY)
   if (Array.isArray(logIds) && logIds.length > 0) {
     const validIds = logIds.filter(Boolean);
     for (let i = 0; i < validIds.length; i += 50) {
       const chunk = validIds.slice(i, i + 50);
       const placeholders = chunk.map(() => '?').join(',');
       await db.execute({
-        sql: `UPDATE Training_TrainingLogs SET Policies = ? WHERE ID IN (${placeholders}) AND (TRIM(Center) = TRIM(?) OR Center IS NULL)`,
+        sql: `UPDATE Training_TrainingLogs SET Policies = ? WHERE ID IN (${placeholders}) AND Center = ?`,
         args: [cleanNewPolicies, ...chunk, center]
       });
     }
   }
 
-  // 2. Also update by session composite match
+  // 2. Also update by session composite match (uses idx_logs_center_cat)
   if (cleanDate && cleanCat && cleanOldPolicies) {
     let sql = `UPDATE Training_TrainingLogs 
                SET Policies = ? 
-               WHERE (Date = ? OR Date LIKE ?) 
-                 AND TRIM(Category) = TRIM(?) 
-                 AND TRIM(Policies) = TRIM(?)
-                 AND (TRIM(Center) = TRIM(?) OR Center IS NULL)`;
-    const args = [cleanNewPolicies, cleanDate, `${cleanDate}%`, cleanCat, cleanOldPolicies, center];
+               WHERE Center = ? 
+                 AND Category = ? 
+                 AND Policies = ?
+                 AND (Date = ? OR Date LIKE ?)`;
+    const args = [cleanNewPolicies, center, cleanCat, cleanOldPolicies, cleanDate, `${cleanDate}%`];
     if (cleanTrainer) {
-      sql += ` AND TRIM(Trainer) = TRIM(?)`;
+      sql += ` AND Trainer = ?`;
       args.push(cleanTrainer);
     }
     await db.execute({ sql, args });
   }
 
-  // 3. Ensure any new policy names exist in Training_Settings for this center
+  // 3. Ensure any new policy names exist in Training_Settings for this center (uses idx_settings_center_type)
   try {
     const parts = cleanNewPolicies.split(/[,،\n]+/).map(p => p.trim()).filter(Boolean);
     for (const pol of parts) {
@@ -972,8 +1016,8 @@ export async function updateSessionPoliciesDb(payload = {}, centerArg = "") {
       const targetToAdd = baseName || pol;
       if (targetToAdd) {
         const existing = await db.execute({
-          sql: "SELECT Value FROM Training_Settings WHERE Type = 'Policy' AND TRIM(Value) = TRIM(?) AND (TRIM(Center) = TRIM(?) OR Center IS NULL) LIMIT 1",
-          args: [targetToAdd, center]
+          sql: "SELECT Value FROM Training_Settings WHERE Center = ? AND Type = 'Policy' AND Value = ? LIMIT 1",
+          args: [center, targetToAdd]
         });
         if (existing.rows.length === 0) {
           await db.execute({
@@ -984,6 +1028,8 @@ export async function updateSessionPoliciesDb(payload = {}, centerArg = "") {
       }
     }
   } catch (err) {}
+
+  invalidateCentersCache();
 
   if (inMemoryCache[center]?.data) {
     const validIdsSet = new Set(Array.isArray(logIds) ? logIds.filter(Boolean).map(String) : []);
@@ -1014,12 +1060,13 @@ export async function deleteTrainingSessionDb(payload = {}, centerArg = "") {
   const { date, category, policies, trainer, logIds, singleLogId } = payload;
   const center = String(payload.center || centerArg || "").trim() || await getDefaultCenterDb();
 
-  // Case 1: Delete only a single trainee record by ID
+  // Case 1: Delete only a single trainee record by ID (uses PRIMARY KEY)
   if (singleLogId) {
     await db.execute({
-      sql: `DELETE FROM Training_TrainingLogs WHERE ID = ? AND (TRIM(Center) = TRIM(?) OR Center IS NULL)`,
+      sql: `DELETE FROM Training_TrainingLogs WHERE ID = ? AND Center = ?`,
       args: [String(singleLogId), center]
     });
+    invalidateCentersCache();
     if (inMemoryCache[center]?.data) {
       inMemoryCache[center].data.logs = inMemoryCache[center].data.logs.filter(l => String(l.ID) !== String(singleLogId));
       inMemoryCache[center].expiresAt = Date.now() + CACHE_TTL_MS;
@@ -1035,13 +1082,13 @@ export async function deleteTrainingSessionDb(payload = {}, centerArg = "") {
       const chunk = validIds.slice(i, i + 50);
       const placeholders = chunk.map(() => '?').join(',');
       await db.execute({
-        sql: `DELETE FROM Training_TrainingLogs WHERE ID IN (${placeholders}) AND (TRIM(Center) = TRIM(?) OR Center IS NULL)`,
+        sql: `DELETE FROM Training_TrainingLogs WHERE ID IN (${placeholders}) AND Center = ?`,
         args: [...chunk, center]
       });
     }
   }
 
-  // Also delete by session composite match
+  // Also delete by session composite match (uses idx_logs_center_cat)
   const cleanTrainer = trainer ? String(trainer).trim() : "";
   const cleanDate = date ? String(date).split('T')[0].trim() : "";
   const cleanCat = category ? String(category).trim() : "";
@@ -1049,17 +1096,19 @@ export async function deleteTrainingSessionDb(payload = {}, centerArg = "") {
 
   if (cleanDate && cleanCat && cleanPol) {
     let sql = `DELETE FROM Training_TrainingLogs 
-               WHERE (Date = ? OR Date LIKE ?) 
-                 AND TRIM(Category) = TRIM(?) 
-                 AND TRIM(Policies) = TRIM(?)
-                 AND (TRIM(Center) = TRIM(?) OR Center IS NULL)`;
-    const args = [cleanDate, `${cleanDate}%`, cleanCat, cleanPol, center];
+               WHERE Center = ? 
+                 AND Category = ? 
+                 AND Policies = ?
+                 AND (Date = ? OR Date LIKE ?)`;
+    const args = [center, cleanCat, cleanPol, cleanDate, `${cleanDate}%`];
     if (cleanTrainer) {
-      sql += ` AND TRIM(Trainer) = TRIM(?)`;
+      sql += ` AND Trainer = ?`;
       args.push(cleanTrainer);
     }
     await db.execute({ sql, args });
   }
+
+  invalidateCentersCache();
 
   if (inMemoryCache[center]?.data) {
     const validIdsSet = new Set(Array.isArray(logIds) ? logIds.filter(Boolean).map(String) : []);
@@ -1096,13 +1145,14 @@ export async function savePlanDb(planData, centerArg = "") {
   const currentYearStr = String(new Date().getFullYear());
   const isCurrentYear = targetYear === currentYearStr;
 
+  const yearCondition = isCurrentYear ? "(Year = ? OR Year = '' OR Year IS NULL)" : "Year = ?";
   const checkResult = await db.execute({
     sql: `SELECT rowid, Month, Category, Year FROM Training_TrainingPlan 
-          WHERE (CAST(Month AS INT) = CAST(? AS INT) OR TRIM(Month) = TRIM(?)) 
-            AND TRIM(Category) = TRIM(?) 
-            AND (TRIM(Year) = TRIM(?) ${isCurrentYear ? "OR Year IS NULL OR TRIM(Year) = ''" : ""})
-            AND (TRIM(Center) = TRIM(?) OR Center IS NULL)`,
-    args: [targetMonth, targetMonth, targetCategory, targetYear, center]
+          WHERE Center = ? 
+            AND ${yearCondition}
+            AND Category = ? 
+            AND (Month = ? OR CAST(Month AS INT) = CAST(? AS INT))`,
+    args: [center, targetYear, targetCategory, targetMonth, targetMonth]
   });
 
   let matchingRow = null;
@@ -1117,15 +1167,16 @@ export async function savePlanDb(planData, centerArg = "") {
       args: [policiesStr, targetMonth, targetCategory, targetYear, center, rowId]
     });
     if (checkResult.rows.length > 1) {
-      await db.execute({
-        sql: `DELETE FROM Training_TrainingPlan 
-              WHERE (CAST(Month AS INT) = CAST(? AS INT) OR TRIM(Month) = TRIM(?)) 
-                AND TRIM(Category) = TRIM(?) 
-                AND (TRIM(Year) = TRIM(?) ${isCurrentYear ? "OR Year IS NULL OR TRIM(Year) = ''" : ""}) 
-                AND (TRIM(Center) = TRIM(?) OR Center IS NULL)
-                AND rowid != ?`,
-        args: [targetMonth, targetMonth, targetCategory, targetYear, center, rowId]
-      });
+      const dupIds = checkResult.rows
+        .map(r => r.rowid ?? r[0])
+        .filter(id => id !== rowId);
+      if (dupIds.length > 0) {
+        const placeholders = dupIds.map(() => '?').join(',');
+        await db.execute({
+          sql: `DELETE FROM Training_TrainingPlan WHERE rowid IN (${placeholders})`,
+          args: dupIds
+        });
+      }
     }
   } else {
     await db.execute({
@@ -1280,7 +1331,7 @@ export async function fetchPlanFromGoogleSheetDb(options = {}, centerArg = "") {
   let { sheetId, targetYear } = options;
   if (!sheetId) {
     const settingRes = await db.execute({
-      sql: "SELECT Value FROM Training_Settings WHERE Type = 'Google_Sheet_ID' AND (TRIM(Center) = TRIM(?) OR Center IS NULL) LIMIT 1;",
+      sql: "SELECT Value FROM Training_Settings WHERE Center = ? AND Type = 'Google_Sheet_ID' LIMIT 1;",
       args: [center]
     });
     sheetId = settingRes.rows[0]?.Value;
@@ -1328,11 +1379,12 @@ export async function saveImportedPlanDb(payload = {}, centerArg = "") {
 
   if (mode === 'replace_year') {
     await db.execute({
-      sql: "DELETE FROM Training_TrainingPlan WHERE TRIM(Year) = TRIM(?) AND (TRIM(Center) = TRIM(?) OR Center IS NULL);",
-      args: [yr, center]
+      sql: "DELETE FROM Training_TrainingPlan WHERE Center = ? AND Year = ?;",
+      args: [center, yr]
     });
   }
 
+  const planBatch = [];
   for (const item of items) {
     const m = String(item.Month || item.month || "").trim();
     const cat = String(item.Category || item.category || "").trim();
@@ -1346,16 +1398,17 @@ export async function saveImportedPlanDb(payload = {}, centerArg = "") {
     if (mode === 'merge') {
       const existing = await db.execute({
         sql: `SELECT rowid FROM Training_TrainingPlan 
-              WHERE (CAST(Month AS INT) = CAST(? AS INT) OR TRIM(Month) = TRIM(?))
-                AND TRIM(Category) = TRIM(?)
-                AND TRIM(Year) = TRIM(?)
-                AND (TRIM(Center) = TRIM(?) OR Center IS NULL) LIMIT 1;`,
-        args: [m, m, cat, itemYear, center]
+              WHERE Center = ?
+                AND Year = ?
+                AND Category = ?
+                AND (Month = ? OR CAST(Month AS INT) = CAST(? AS INT))
+              LIMIT 1;`,
+        args: [center, itemYear, cat, m, m]
       });
 
       if (existing.rows.length > 0) {
         const rowId = existing.rows[0].rowid ?? existing.rows[0][0];
-        await db.execute({
+        planBatch.push({
           sql: `UPDATE Training_TrainingPlan SET Policies = ?, Center = ? WHERE rowid = ?;`,
           args: [pol, center, rowId]
         });
@@ -1363,10 +1416,14 @@ export async function saveImportedPlanDb(payload = {}, centerArg = "") {
       }
     }
 
-    await db.execute({
+    planBatch.push({
       sql: `INSERT INTO Training_TrainingPlan (Month, Category, Policies, Year, Center) VALUES (?, ?, ?, ?, ?);`,
       args: [m, cat, pol, itemYear, center]
     });
+  }
+
+  if (planBatch.length > 0) {
+    await db.batch(planBatch, "write");
   }
 
   invalidateCache(center);
@@ -1380,9 +1437,9 @@ export async function updateEmployeesBulkDb(updatedEmployees, centerArg = "") {
   await createTablesAndMigrate();
   const center = String(centerArg || "").trim() || await getDefaultCenterDb();
 
-  // 1. Fetch current employees in database for this center
+  // 1. Fetch current employees in database for this center (uses idx_emp_center)
   const existingResult = await db.execute({
-    sql: "SELECT ID, Name FROM Training_Employees WHERE TRIM(Center) = TRIM(?) OR Center IS NULL;",
+    sql: "SELECT ID, Name FROM Training_Employees WHERE Center = ?;",
     args: [center]
   });
   const existingMap = new Map();
@@ -1398,21 +1455,24 @@ export async function updateEmployeesBulkDb(updatedEmployees, centerArg = "") {
   const updatedNames = new Set(validUpdated.map(e => String(e.Name).trim()));
   const updatedIds = new Set(validUpdated.filter(e => e.ID).map(e => String(e.ID).trim()));
 
-  // 2. Check for renamed employees
+  // 2. Check for renamed employees (uses idx_logs_center_trainee)
+  const renamedPairs = [];
+  const logMutationBatch = [];
   for (const emp of validUpdated) {
     if (emp.ID && existingMap.has(String(emp.ID).trim())) {
       const oldName = existingMap.get(String(emp.ID).trim());
       const newName = String(emp.Name).trim();
       if (oldName && newName && oldName !== newName) {
-        await db.execute({
-          sql: "UPDATE Training_TrainingLogs SET TraineeName = ? WHERE (TRIM(TraineeName) = TRIM(?) OR TraineeName = ?) AND (TRIM(Center) = TRIM(?) OR Center IS NULL)",
-          args: [newName, oldName, oldName, center]
+        renamedPairs.push([oldName, newName]);
+        logMutationBatch.push({
+          sql: "UPDATE Training_TrainingLogs SET TraineeName = ? WHERE Center = ? AND TraineeName = ?",
+          args: [newName, center, oldName]
         });
       }
     }
   }
 
-  // 3. Find and delete logs for all deleted employees of this center
+  // 3. Find and delete logs for all deleted employees of this center (uses idx_logs_center_trainee)
   const deletedNames = new Set();
   for (const [id, oldName] of existingMap.entries()) {
     if (!updatedIds.has(id) && !updatedNames.has(oldName)) {
@@ -1426,24 +1486,33 @@ export async function updateEmployeesBulkDb(updatedEmployees, centerArg = "") {
   }
 
   for (const name of deletedNames) {
-    await db.execute({
-      sql: "DELETE FROM Training_TrainingLogs WHERE (TRIM(TraineeName) = TRIM(?) OR TraineeName = ?) AND (TRIM(Center) = TRIM(?) OR Center IS NULL)",
-      args: [name, name, center]
+    logMutationBatch.push({
+      sql: "DELETE FROM Training_TrainingLogs WHERE Center = ? AND TraineeName = ?",
+      args: [center, name]
     });
   }
 
-  // 4. Update Training_Employees for this center ONLY
+  if (logMutationBatch.length > 0) {
+    await db.batch(logMutationBatch, "write");
+  }
+
+  // 4. Update Training_Employees for this center ONLY (uses idx_emp_center)
   await db.execute({
-    sql: "DELETE FROM Training_Employees WHERE TRIM(Center) = TRIM(?) OR Center IS NULL;",
+    sql: "DELETE FROM Training_Employees WHERE Center = ?;",
     args: [center]
   });
 
   const batchStatements = [];
+  const finalEmployees = [];
   for (const emp of validUpdated) {
-    const id = emp.ID || Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+    const id = String(emp.ID || (Math.random().toString(36).substr(2, 9) + Date.now().toString(36))).trim();
+    const name = emp.Name.trim();
+    const job = (emp.Job || "").trim();
+    const category = (emp.Category || "").trim();
+    finalEmployees.push({ ID: id, Name: name, Job: job, Category: category });
     batchStatements.push({
       sql: "INSERT OR REPLACE INTO Training_Employees (ID, Name, Job, Category, Center) VALUES (?, ?, ?, ?, ?)",
-      args: [id, emp.Name.trim(), (emp.Job || "").trim(), (emp.Category || "").trim(), center]
+      args: [id, name, job, category, center]
     });
   }
 
@@ -1455,7 +1524,24 @@ export async function updateEmployeesBulkDb(updatedEmployees, centerArg = "") {
     }
   }
 
-  invalidateCache(center);
+  invalidateCentersCache();
+
+  if (inMemoryCache[center]?.data) {
+    inMemoryCache[center].data.employees = finalEmployees;
+    if (renamedPairs.length > 0 || deletedNames.size > 0) {
+      const renameMap = new Map(renamedPairs);
+      inMemoryCache[center].data.logs = inMemoryCache[center].data.logs
+        .filter(l => !deletedNames.has(String(l.TraineeName || "").trim()))
+        .map(l => {
+          const tName = String(l.TraineeName || "").trim();
+          return renameMap.has(tName) ? { ...l, TraineeName: renameMap.get(tName) } : l;
+        });
+    }
+    inMemoryCache[center].data.categories = computeUniqueCategories(inMemoryCache[center].data.settings, finalEmployees);
+    inMemoryCache[center].expiresAt = Date.now() + CACHE_TTL_MS;
+    return inMemoryCache[center].data;
+  }
+
   return getAllDataDb({ center, forceRefresh: true });
 }
 
@@ -1469,7 +1555,7 @@ export async function deleteEmployeeDb(id, fallbackName, centerArg = "") {
 
   if (id) {
     const existing = await db.execute({
-      sql: "SELECT Name FROM Training_Employees WHERE ID = ? AND (TRIM(Center) = TRIM(?) OR Center IS NULL)",
+      sql: "SELECT Name FROM Training_Employees WHERE ID = ? AND Center = ?",
       args: [id, center]
     });
     if (existing.rows.length > 0 && existing.rows[0].Name) {
@@ -1477,26 +1563,44 @@ export async function deleteEmployeeDb(id, fallbackName, centerArg = "") {
     }
   }
 
+  const deleteBatch = [];
   if (id) {
-    await db.execute({
-      sql: "DELETE FROM Training_Employees WHERE ID = ? AND (TRIM(Center) = TRIM(?) OR Center IS NULL)",
+    deleteBatch.push({
+      sql: "DELETE FROM Training_Employees WHERE ID = ? AND Center = ?",
       args: [id, center]
     });
   }
-
   if (empName) {
-    await db.execute({
-      sql: "DELETE FROM Training_Employees WHERE (TRIM(Name) = TRIM(?) OR Name = ?) AND (TRIM(Center) = TRIM(?) OR Center IS NULL)",
-      args: [empName, empName, center]
+    deleteBatch.push({
+      sql: "DELETE FROM Training_Employees WHERE Center = ? AND Name = ?",
+      args: [center, empName]
     });
-
-    await db.execute({
-      sql: "DELETE FROM Training_TrainingLogs WHERE (TRIM(TraineeName) = TRIM(?) OR TraineeName = ?) AND (TRIM(Center) = TRIM(?) OR Center IS NULL)",
-      args: [empName, empName, center]
+    deleteBatch.push({
+      sql: "DELETE FROM Training_TrainingLogs WHERE Center = ? AND TraineeName = ?",
+      args: [center, empName]
     });
   }
 
-  invalidateCache(center);
+  if (deleteBatch.length > 0) {
+    await db.batch(deleteBatch, "write");
+  }
+
+  invalidateCentersCache();
+
+  if (inMemoryCache[center]?.data) {
+    inMemoryCache[center].data.employees = inMemoryCache[center].data.employees.filter(e => {
+      if (id && String(e.ID) === String(id)) return false;
+      if (empName && String(e.Name || "").trim() === empName) return false;
+      return true;
+    });
+    if (empName) {
+      inMemoryCache[center].data.logs = inMemoryCache[center].data.logs.filter(l => String(l.TraineeName || "").trim() !== empName);
+    }
+    inMemoryCache[center].data.categories = computeUniqueCategories(inMemoryCache[center].data.settings, inMemoryCache[center].data.employees);
+    inMemoryCache[center].expiresAt = Date.now() + CACHE_TTL_MS;
+    return inMemoryCache[center].data;
+  }
+
   return getAllDataDb({ center, forceRefresh: true });
 }
 
@@ -1506,24 +1610,38 @@ export async function deleteEmployeeDb(id, fallbackName, centerArg = "") {
 export async function saveSettingsItemDb(type, value, centerArg = "") {
   await createTablesAndMigrate();
   const center = String(centerArg || "").trim() || await getDefaultCenterDb();
+  const cleanType = String(type || "").trim();
+  const cleanVal = String(value || "").trim();
   const singleValueTypes = [
     'Hospital_Name', 'Hospital_Logo', 'Hospital_Logo_Left', 'IC_Manager_Title', 'IC_Manager_Name', 'Hospital_Manager_Title', 'Hospital_Manager_Name',
     'Google_Sheet_ID'
   ];
 
-  if (type.startsWith('Password_') || singleValueTypes.includes(type)) {
-    await db.execute({
-      sql: "DELETE FROM Training_Settings WHERE Type = ? AND (TRIM(Center) = TRIM(?) OR Center IS NULL)",
-      args: [type, center]
+  const isSingle = cleanType.startsWith('Password_') || singleValueTypes.includes(cleanType);
+  const stmts = [];
+  if (isSingle) {
+    stmts.push({
+      sql: "DELETE FROM Training_Settings WHERE Center = ? AND Type = ?",
+      args: [center, cleanType]
     });
   }
-
-  await db.execute({
+  stmts.push({
     sql: "INSERT INTO Training_Settings (Type, Value, Center) VALUES (?, ?, ?)",
-    args: [type, String(value || "").trim(), center]
+    args: [cleanType, cleanVal, center]
   });
 
-  invalidateCache(center);
+  await db.batch(stmts, "write");
+
+  if (inMemoryCache[center]?.data) {
+    if (isSingle) {
+      inMemoryCache[center].data.settings = inMemoryCache[center].data.settings.filter(s => s.Type !== cleanType);
+    }
+    inMemoryCache[center].data.settings.push({ Type: cleanType, Value: cleanVal });
+    inMemoryCache[center].data.categories = computeUniqueCategories(inMemoryCache[center].data.settings, inMemoryCache[center].data.employees);
+    inMemoryCache[center].expiresAt = Date.now() + CACHE_TTL_MS;
+    return inMemoryCache[center].data;
+  }
+
   return getAllDataDb({ center, forceRefresh: true });
 }
 
@@ -1533,13 +1651,23 @@ export async function saveSettingsItemDb(type, value, centerArg = "") {
 export async function deleteSettingsItemDb(type, value, centerArg = "") {
   await createTablesAndMigrate();
   const center = String(centerArg || "").trim() || await getDefaultCenterDb();
+  const cleanType = String(type || "").trim();
+  const cleanVal = String(value || "").trim();
 
   await db.execute({
-    sql: "DELETE FROM Training_Settings WHERE Type = ? AND Value = ? AND (TRIM(Center) = TRIM(?) OR Center IS NULL)",
-    args: [type, value, center]
+    sql: "DELETE FROM Training_Settings WHERE Center = ? AND Type = ? AND Value = ?",
+    args: [center, cleanType, cleanVal]
   });
 
-  invalidateCache(center);
+  if (inMemoryCache[center]?.data) {
+    inMemoryCache[center].data.settings = inMemoryCache[center].data.settings.filter(
+      s => !(String(s.Type || "").trim() === cleanType && String(s.Value || "").trim() === cleanVal)
+    );
+    inMemoryCache[center].data.categories = computeUniqueCategories(inMemoryCache[center].data.settings, inMemoryCache[center].data.employees);
+    inMemoryCache[center].expiresAt = Date.now() + CACHE_TTL_MS;
+    return inMemoryCache[center].data;
+  }
+
   return getAllDataDb({ center, forceRefresh: true });
 }
 
@@ -1601,45 +1729,70 @@ export async function renamePolicyDb(oldPolicy, newPolicy, centerArg = "") {
     return getAllDataDb({ center });
   }
 
-  // 1. Update in Training_Settings
+  // 1. Update in Training_Settings (uses idx_settings_center_type)
   await db.execute({
-    sql: "UPDATE Training_Settings SET Value = ? WHERE Type = 'Policy' AND (Value = ? OR TRIM(Value) = TRIM(?)) AND (TRIM(Center) = TRIM(?) OR Center IS NULL)",
-    args: [newTrimmed, oldTrimmed, oldTrimmed, center]
+    sql: "UPDATE Training_Settings SET Value = ? WHERE Center = ? AND Type = 'Policy' AND Value = ?",
+    args: [newTrimmed, center, oldTrimmed]
   });
 
-  // 2. Update in Training_TrainingPlan
+  // 2. Update in Training_TrainingPlan (uses idx_plan_center)
   const planRows = await db.execute({
-    sql: "SELECT rowid, Policies FROM Training_TrainingPlan WHERE Policies LIKE ? AND (TRIM(Center) = TRIM(?) OR Center IS NULL)",
-    args: [`%${oldTrimmed}%`, center]
+    sql: "SELECT rowid, Policies FROM Training_TrainingPlan WHERE Center = ? AND Policies LIKE ?",
+    args: [center, `%${oldTrimmed}%`]
   });
+  const updateBatch = [];
   for (const row of planRows.rows) {
     const updatedPolicies = replacePolicyInString(String(row.Policies || ""), oldTrimmed, newTrimmed);
     if (updatedPolicies !== row.Policies) {
       const rowId = row.rowid ?? row[0];
-      await db.execute({
+      updateBatch.push({
         sql: "UPDATE Training_TrainingPlan SET Policies = ?, Center = ? WHERE rowid = ?",
         args: [updatedPolicies, center, rowId]
       });
     }
   }
 
-  // 3. Update in Training_TrainingLogs
+  // 3. Update in Training_TrainingLogs (uses idx_logs_center)
   const logRows = await db.execute({
-    sql: "SELECT ID, rowid, Policies FROM Training_TrainingLogs WHERE Policies LIKE ? AND (TRIM(Center) = TRIM(?) OR Center IS NULL)",
-    args: [`%${oldTrimmed}%`, center]
+    sql: "SELECT ID, rowid, Policies FROM Training_TrainingLogs WHERE Center = ? AND Policies LIKE ?",
+    args: [center, `%${oldTrimmed}%`]
   });
   for (const row of logRows.rows) {
     const updatedPolicies = replacePolicyInString(String(row.Policies || ""), oldTrimmed, newTrimmed);
     if (updatedPolicies !== row.Policies) {
       const logId = row.ID || row.rowid;
-      await db.execute({
-        sql: "UPDATE Training_TrainingLogs SET Policies = ? WHERE (ID = ? OR rowid = ?) AND (TRIM(Center) = TRIM(?) OR Center IS NULL)",
+      updateBatch.push({
+        sql: "UPDATE Training_TrainingLogs SET Policies = ? WHERE (ID = ? OR rowid = ?) AND Center = ?",
         args: [updatedPolicies, logId, logId, center]
       });
     }
   }
 
-  invalidateCache(center);
+  if (updateBatch.length > 0) {
+    const chunkSize = 500;
+    for (let i = 0; i < updateBatch.length; i += chunkSize) {
+      await db.batch(updateBatch.slice(i, i + chunkSize), "write");
+    }
+  }
+
+  invalidateCentersCache();
+
+  if (inMemoryCache[center]?.data) {
+    inMemoryCache[center].data.settings.forEach(s => {
+      if (s.Type === 'Policy' && String(s.Value || "").trim() === oldTrimmed) {
+        s.Value = newTrimmed;
+      }
+    });
+    inMemoryCache[center].data.plan.forEach(p => {
+      p.Policies = replacePolicyInString(String(p.Policies || ""), oldTrimmed, newTrimmed);
+    });
+    inMemoryCache[center].data.logs.forEach(l => {
+      l.Policies = replacePolicyInString(String(l.Policies || ""), oldTrimmed, newTrimmed);
+    });
+    inMemoryCache[center].expiresAt = Date.now() + CACHE_TTL_MS;
+    return inMemoryCache[center].data;
+  }
+
   return getAllDataDb({ center, forceRefresh: true });
 }
 
@@ -1791,7 +1944,7 @@ export async function importFromPreviousTursoDb(payload = {}) {
 
   // Ensure target center exists in Training_Centers
   const existingCenter = await db.execute({
-    sql: "SELECT Name FROM Training_Centers WHERE TRIM(Name) = TRIM(?) LIMIT 1;",
+    sql: "SELECT Name FROM Training_Centers WHERE Name = ? LIMIT 1;",
     args: [cleanTargetCenter]
   });
   if (existingCenter.rows.length === 0) {
@@ -1822,31 +1975,23 @@ export async function importFromPreviousTursoDb(payload = {}) {
   let importedPlanCount = 0;
   let importedSettingsCount = 0;
 
-  // 4. If mode is 'replace', clear existing records for cleanTargetCenter
+  // 4. If mode is 'replace', clear existing records for cleanTargetCenter (uses idx_*_center)
   if (mode === 'replace') {
+    const clearBatch = [];
     if (importEmployees) {
-      await db.execute({
-        sql: "DELETE FROM Training_Employees WHERE TRIM(Center) = TRIM(?);",
-        args: [cleanTargetCenter]
-      });
+      clearBatch.push({ sql: "DELETE FROM Training_Employees WHERE Center = ?;", args: [cleanTargetCenter] });
     }
     if (importLogs) {
-      await db.execute({
-        sql: "DELETE FROM Training_TrainingLogs WHERE TRIM(Center) = TRIM(?);",
-        args: [cleanTargetCenter]
-      });
+      clearBatch.push({ sql: "DELETE FROM Training_TrainingLogs WHERE Center = ?;", args: [cleanTargetCenter] });
     }
     if (importPlan) {
-      await db.execute({
-        sql: "DELETE FROM Training_TrainingPlan WHERE TRIM(Center) = TRIM(?);",
-        args: [cleanTargetCenter]
-      });
+      clearBatch.push({ sql: "DELETE FROM Training_TrainingPlan WHERE Center = ?;", args: [cleanTargetCenter] });
     }
     if (importSettings) {
-      await db.execute({
-        sql: "DELETE FROM Training_Settings WHERE TRIM(Center) = TRIM(?);",
-        args: [cleanTargetCenter]
-      });
+      clearBatch.push({ sql: "DELETE FROM Training_Settings WHERE Center = ?;", args: [cleanTargetCenter] });
+    }
+    if (clearBatch.length > 0) {
+      await db.batch(clearBatch, "write");
     }
   }
 
@@ -1864,7 +2009,7 @@ export async function importFromPreviousTursoDb(payload = {}) {
     const remoteEmployeesRes = await remoteDb.execute(remoteEmployeesQuery);
 
     const existingLocalEmpRes = await db.execute({
-      sql: "SELECT ID, Name FROM Training_Employees WHERE TRIM(Center) = TRIM(?);",
+      sql: "SELECT ID, Name FROM Training_Employees WHERE Center = ?;",
       args: [cleanTargetCenter]
     });
     const existingEmpNames = new Set(existingLocalEmpRes.rows.map(r => String(r.Name || "").trim()));
@@ -1918,7 +2063,7 @@ export async function importFromPreviousTursoDb(payload = {}) {
     const remoteLogsRes = await remoteDb.execute(remoteLogsQuery);
 
     const existingLocalLogsRes = await db.execute({
-      sql: "SELECT Date, TraineeName, Category, Policies FROM Training_TrainingLogs WHERE TRIM(Center) = TRIM(?);",
+      sql: "SELECT Date, TraineeName, Category, Policies FROM Training_TrainingLogs WHERE Center = ?;",
       args: [cleanTargetCenter]
     });
     const existingLogSigs = new Set();
@@ -2004,11 +2149,12 @@ export async function importFromPreviousTursoDb(payload = {}) {
       if (mode === 'merge') {
         const existingPlanRes = await db.execute({
           sql: `SELECT rowid, Policies FROM Training_TrainingPlan 
-                WHERE (CAST(Month AS INT) = CAST(? AS INT) OR TRIM(Month) = TRIM(?))
-                  AND TRIM(Category) = TRIM(?)
-                  AND TRIM(Year) = TRIM(?)
-                  AND TRIM(Center) = TRIM(?) LIMIT 1;`,
-          args: [m, m, cat, yr, cleanTargetCenter]
+                WHERE Center = ?
+                  AND Year = ?
+                  AND Category = ?
+                  AND (Month = ? OR CAST(Month AS INT) = CAST(? AS INT))
+                LIMIT 1;`,
+          args: [cleanTargetCenter, yr, cat, m, m]
         });
 
         if (existingPlanRes.rows.length > 0) {
@@ -2044,13 +2190,14 @@ export async function importFromPreviousTursoDb(payload = {}) {
     const remoteSettingsRes = await remoteDb.execute(remoteSettingsQuery);
 
     const existingSettingsRes = await db.execute({
-      sql: "SELECT Type, Value FROM Training_Settings WHERE TRIM(Center) = TRIM(?);",
+      sql: "SELECT Type, Value FROM Training_Settings WHERE Center = ?;",
       args: [cleanTargetCenter]
     });
     const existingSettingsSet = new Set(
       existingSettingsRes.rows.map(r => `${String(r.Type || "").trim()}|${String(r.Value || "").trim()}`)
     );
 
+    const settingsBatch = [];
     for (const r of remoteSettingsRes.rows) {
       const type = String(r.Type || "").trim();
       const val = String(r.Value || "").trim();
@@ -2058,12 +2205,9 @@ export async function importFromPreviousTursoDb(payload = {}) {
       if (type.startsWith('Password_') || !val) continue;
 
       if (type === 'Hospital_Name') {
-        const exists = await db.execute({
-          sql: "SELECT Value FROM Training_Settings WHERE Type = 'Hospital_Name' AND TRIM(Center) = TRIM(?);",
-          args: [cleanTargetCenter]
-        });
-        if (exists.rows.length === 0) {
-          await db.execute({
+        const hasHospitalName = existingSettingsRes.rows.some(er => String(er.Type || "").trim() === 'Hospital_Name');
+        if (!hasHospitalName) {
+          settingsBatch.push({
             sql: "INSERT INTO Training_Settings (Type, Value, Center) VALUES ('Hospital_Name', ?, ?);",
             args: [val, cleanTargetCenter]
           });
@@ -2076,16 +2220,21 @@ export async function importFromPreviousTursoDb(payload = {}) {
       if (existingSettingsSet.has(sig)) continue;
       existingSettingsSet.add(sig);
 
-      await db.execute({
+      settingsBatch.push({
         sql: "INSERT INTO Training_Settings (Type, Value, Center) VALUES (?, ?, ?);",
         args: [type, val, cleanTargetCenter]
       });
       importedSettingsCount++;
     }
+
+    if (settingsBatch.length > 0) {
+      await db.batch(settingsBatch, "write");
+    }
   }
 
   // 9. Invalidate cache for the target center
   invalidateCache(cleanTargetCenter);
+  invalidateCentersCache();
 
   return {
     success: true,

@@ -6,9 +6,6 @@ import { fileURLToPath } from 'url';
 import {
   createTablesAndMigrate,
   getAllDataDb,
-  getCentersDb,
-  addCenterDb,
-  deleteCenterDb,
   saveTrainingSessionDb,
   savePlanDb,
   savePlanBatchDb,
@@ -24,7 +21,10 @@ import {
   deleteTrainingSessionDb,
   addTraineesToSessionDb,
   testPreviousTursoDb,
-  importFromPreviousTursoDb
+  importFromPreviousTursoDb,
+  getCentersDb,
+  addCenterDb,
+  deleteCenterDb
 } from './db.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -33,7 +33,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // Initialize database on startup
 createTablesAndMigrate().then(() => {
@@ -44,57 +44,73 @@ createTablesAndMigrate().then(() => {
 
 app.post('/api/gas', async (req, res) => {
   try {
-    const { func, args = [], center: bodyCenter } = req.body;
-    console.log(`Executing database operation via Express: ${func}`);
-    
-    const center = bodyCenter || (args[0] && typeof args[0] === 'object' ? args[0].center : null) || (func === 'getAllData' && typeof args[0] === 'string' ? args[0] : null);
+    const { func, args = [], center: bodyCenter } = req.body || {};
+    const activeCenter =
+      (typeof bodyCenter === 'string' && bodyCenter.trim() && !bodyCenter.includes('[object'))
+        ? bodyCenter.trim()
+        : (args[0] && typeof args[0] === 'object' && typeof args[0].center === 'string' && args[0].center.trim())
+          ? args[0].center.trim()
+          : "";
+
+    console.log(`Executing database operation via Express: ${func}${activeCenter ? ` [Center: ${activeCenter}]` : ''}`);
 
     let result;
-    
+
     if (func === 'getCenters') {
-      result = await getCentersDb();
+      result = await getCentersDb(Boolean(args[0]?.forceRefresh || args[0] === true));
     } else if (func === 'addCenter') {
-      result = await addCenterDb(args[0]);
+      const centerName = typeof args[0] === 'string' ? args[0] : args[0]?.name;
+      result = await addCenterDb(centerName);
     } else if (func === 'deleteCenter') {
-      result = await deleteCenterDb(args[0]);
+      const centerName = typeof args[0] === 'string' ? args[0] : args[0]?.name;
+      result = await deleteCenterDb(centerName);
     } else if (func === 'testPreviousTursoDb') {
       result = await testPreviousTursoDb(args[0]);
     } else if (func === 'importFromPreviousTursoDb') {
-      result = await importFromPreviousTursoDb(args[0]);
+      const importPayload = args[0] && typeof args[0] === 'object'
+        ? { ...args[0], targetCenter: args[0].targetCenter || activeCenter }
+        : args[0];
+      result = await importFromPreviousTursoDb(importPayload);
     } else if (func === 'getAllData') {
-      result = await getAllDataDb(center || args[0]);
+      if (typeof args[0] === 'string') {
+        result = await getAllDataDb({ center: args[0], forceRefresh: Boolean(args[1]) });
+      } else if (args[0] && typeof args[0] === 'object') {
+        result = await getAllDataDb({ ...args[0], center: args[0].center || activeCenter });
+      } else {
+        result = await getAllDataDb({ center: activeCenter });
+      }
     } else if (func === 'saveTrainingSession') {
-      result = await saveTrainingSessionDb(args[0], center);
+      result = await saveTrainingSessionDb(args[0], activeCenter);
     } else if (func === 'addTraineesToSession') {
-      result = await addTraineesToSessionDb(args[0], center);
+      result = await addTraineesToSessionDb(args[0], activeCenter);
     } else if (func === 'savePlan') {
-      result = await savePlanDb(args[0], center);
+      result = await savePlanDb(args[0], activeCenter);
     } else if (func === 'savePlanBatch') {
-      result = await savePlanBatchDb(args[0], center);
+      result = await savePlanBatchDb(args[0], activeCenter);
     } else if (func === 'updateEmployeesBulk') {
-      result = await updateEmployeesBulkDb(args[0], center);
+      result = await updateEmployeesBulkDb(args[0], activeCenter);
     } else if (func === 'deleteEmployee') {
-      result = await deleteEmployeeDb(args[0], args[1], center);
+      result = await deleteEmployeeDb(args[0], args[1], activeCenter);
     } else if (func === 'saveSettingsItem') {
-      result = await saveSettingsItemDb(args[0], args[1], center);
+      result = await saveSettingsItemDb(args[0], args[1], activeCenter);
     } else if (func === 'deleteSettingsItem') {
-      result = await deleteSettingsItemDb(args[0], args[1], center);
+      result = await deleteSettingsItemDb(args[0], args[1], activeCenter);
     } else if (func === 'renamePolicy') {
-      result = await renamePolicyDb(args[0], args[1], center);
+      result = await renamePolicyDb(args[0], args[1], activeCenter);
     } else if (func === 'fetchPlanFromGoogleSheet') {
-      result = await fetchPlanFromGoogleSheetDb(args[0], center);
+      result = await fetchPlanFromGoogleSheetDb(args[0], activeCenter);
     } else if (func === 'saveImportedPlan') {
-      result = await saveImportedPlanDb(args[0], center);
+      result = await saveImportedPlanDb(args[0], activeCenter);
     } else if (func === 'updateSessionTrainer') {
-      result = await updateSessionTrainerDb(args[0], center);
+      result = await updateSessionTrainerDb(args[0], activeCenter);
     } else if (func === 'updateSessionPolicies') {
-      result = await updateSessionPoliciesDb(args[0], center);
+      result = await updateSessionPoliciesDb(args[0], activeCenter);
     } else if (func === 'deleteTrainingSession') {
-      result = await deleteTrainingSessionDb(args[0], center);
+      result = await deleteTrainingSessionDb(args[0], activeCenter);
     } else {
       return res.status(400).json({ status: 'error', message: `Function not found: ${func}` });
     }
-    
+
     res.json({ status: 'success', data: result });
   } catch (err) {
     console.error(`Error executing ${req.body?.func || 'unknown'}:`, err);
