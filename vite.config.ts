@@ -21,7 +21,8 @@ import {
   importFromPreviousTursoDb,
   getCentersDb,
   addCenterDb,
-  deleteCenterDb
+  deleteCenterDb,
+  saveVisitDaysDb
 } from './api/db.js';
 
 // Simple Vite plugin to run the Vercel serverless function locally with SQLite / Turso database
@@ -98,6 +99,8 @@ const vercelApiMock = () => {
                 result = await deleteSettingsItemDb(args[0], args[1], activeCenter);
               } else if (func === 'renamePolicy') {
                 result = await renamePolicyDb(args[0], args[1], activeCenter);
+              } else if (func === 'saveVisitDays') {
+                result = await saveVisitDaysDb(args[0], activeCenter);
               } else if (func === 'updateSessionTrainer') {
                 result = await updateSessionTrainerDb(args[0], activeCenter);
               } else if (func === 'updateSessionPolicies') {

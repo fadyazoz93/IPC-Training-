@@ -24,7 +24,8 @@ import {
   importFromPreviousTursoDb,
   getCentersDb,
   addCenterDb,
-  deleteCenterDb
+  deleteCenterDb,
+  saveVisitDaysDb
 } from './db.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -97,6 +98,8 @@ app.post('/api/gas', async (req, res) => {
       result = await deleteSettingsItemDb(args[0], args[1], activeCenter);
     } else if (func === 'renamePolicy') {
       result = await renamePolicyDb(args[0], args[1], activeCenter);
+    } else if (func === 'saveVisitDays') {
+      result = await saveVisitDaysDb(args[0], activeCenter);
     } else if (func === 'fetchPlanFromGoogleSheet') {
       result = await fetchPlanFromGoogleSheetDb(args[0], activeCenter);
     } else if (func === 'saveImportedPlan') {

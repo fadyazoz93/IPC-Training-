@@ -1614,7 +1614,7 @@ export async function saveSettingsItemDb(type, value, centerArg = "") {
   const cleanVal = String(value || "").trim();
   const singleValueTypes = [
     'Hospital_Name', 'Hospital_Logo', 'Hospital_Logo_Left', 'IC_Manager_Title', 'IC_Manager_Name', 'Hospital_Manager_Title', 'Hospital_Manager_Name',
-    'Google_Sheet_ID'
+    'Google_Sheet_ID', 'Visit_Days'
   ];
 
   const isSingle = cleanType.startsWith('Password_') || singleValueTypes.includes(cleanType);
@@ -1794,6 +1794,241 @@ export async function renamePolicyDb(oldPolicy, newPolicy, centerArg = "") {
   }
 
   return getAllDataDb({ center, forceRefresh: true });
+}
+
+/**
+ * Normalizes a Visit_Days input (array or comma-separated string) into sorted unique weekday ints (0=Sun..6=Sat).
+ */
+function normalizeVisitDays(input) {
+  let raw = [];
+  if (Array.isArray(input)) {
+    raw = input;
+  } else if (typeof input === 'string') {
+    raw = input.split(',');
+  } else if (input && typeof input === 'object' && Array.isArray(input.visitDays)) {
+    raw = input.visitDays;
+  }
+  const set = new Set();
+  for (const v of raw) {
+    const num = parseInt(String(v).trim(), 10);
+    if (!Number.isNaN(num) && num >= 0 && num <= 6) {
+      set.add(num);
+    }
+  }
+  return Array.from(set).sort((a, b) => a - b);
+}
+
+/**
+ * Parses a YYYY-MM-DD date string safely without timezone shift.
+ */
+function parseYmdSafe(dateStr) {
+  if (!dateStr) return null;
+  const clean = String(dateStr).split('T')[0].trim();
+  const m = clean.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const year = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10);
+  const day = parseInt(m[3], 10);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return { year, month, day, clean };
+}
+
+function formatYmdSafe(year, month, day) {
+  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+/**
+ * Snaps a YYYY-MM-DD date to the nearest matching weekday in visitDays within the SAME month.
+ * Optionally avoids dates in excludeDatesSet (used for 2-day policies so both dates stay distinct).
+ */
+function snapDateToNearestVisitDay(dateStr, visitDays, excludeDatesSet = null) {
+  const parsed = parseYmdSafe(dateStr);
+  if (!parsed) return dateStr;
+  if (!visitDays || visitDays.length === 0 || visitDays.length >= 7) {
+    return parsed.clean;
+  }
+
+  const { year, month, day, clean } = parsed;
+  const currentDow = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+  if (visitDays.includes(currentDow) && (!excludeDatesSet || !excludeDatesSet.has(clean))) {
+    return clean;
+  }
+
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  let bestDay = null;
+  let bestDiff = Infinity;
+
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dow = new Date(Date.UTC(year, month - 1, d)).getUTCDay();
+    if (!visitDays.includes(dow)) continue;
+    const candidate = formatYmdSafe(year, month, d);
+    if (excludeDatesSet && excludeDatesSet.has(candidate)) continue;
+    const diff = Math.abs(d - day);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestDay = d;
+    }
+  }
+
+  // Fallback if all valid dates in month were excluded
+  if (bestDay === null) {
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dow = new Date(Date.UTC(year, month - 1, d)).getUTCDay();
+      if (!visitDays.includes(dow)) continue;
+      const diff = Math.abs(d - day);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestDay = d;
+      }
+    }
+  }
+
+  return bestDay !== null ? formatYmdSafe(year, month, bestDay) : clean;
+}
+
+/**
+ * Splits a policies string by commas outside parentheses, snaps any embedded dates
+ * (e.g., "غسل الأيدي (يوم واحد - 2026-11-12)") to the nearest visit days, and rebuilds the string.
+ */
+function snapDatesInPoliciesString(policiesStr, visitDays) {
+  if (!policiesStr || !visitDays || visitDays.length === 0 || visitDays.length >= 7) {
+    return policiesStr;
+  }
+  const items = [];
+  let current = "";
+  let parenCount = 0;
+  for (let i = 0; i < policiesStr.length; i++) {
+    const ch = policiesStr[i];
+    if (ch === '(') parenCount++;
+    else if (ch === ')') parenCount--;
+    if (ch === ',' && parenCount === 0) {
+      items.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  if (current.trim()) items.push(current.trim());
+
+  const updatedItems = items.map(item => {
+    const match = item.match(/^(.*?)\s*\(([^)]+)\)\s*$/);
+    if (!match) return item;
+    const base = match[1].trim();
+    const inner = match[2].trim();
+    const parts = inner.split(" - ");
+    if (parts.length < 2) return item;
+
+    const dayLabel = parts[0].trim();
+    const rawDates = parts.slice(1).join(" - ").split(",").map(s => s.trim()).filter(Boolean);
+    if (rawDates.length === 0) return item;
+
+    const usedDates = new Set();
+    const snappedDates = rawDates.map(rawD => {
+      const snapped = snapDateToNearestVisitDay(rawD, visitDays, rawDates.length > 1 ? usedDates : null);
+      usedDates.add(snapped);
+      return snapped;
+    }).sort((a, b) => a.localeCompare(b));
+
+    return `${base} (${dayLabel} - ${snappedDates.join(", ")})`;
+  });
+
+  return updatedItems.join(", ");
+}
+
+/**
+ * Saves weekly Visit_Days for a center and automatically migrates all saved dates
+ * in Training_TrainingPlan and Training_TrainingLogs to the nearest matching visit day in the same month.
+ */
+export async function saveVisitDaysDb(visitDaysArg, centerArg = "") {
+  await createTablesAndMigrate();
+  const center = String(centerArg || "").trim() || await getDefaultCenterDb();
+  const visitDays = normalizeVisitDays(visitDaysArg);
+  // If all 7 days are selected, treat as unrestricted (empty) or keep all 7 — keeping normalized string makes checkboxes persist accurately
+  const serialized = visitDays.join(",");
+
+  // 1. Persist Visit_Days setting for this center
+  await db.batch([
+    {
+      sql: "DELETE FROM Training_Settings WHERE Center = ? AND Type = 'Visit_Days';",
+      args: [center]
+    },
+    {
+      sql: "INSERT INTO Training_Settings (Type, Value, Center) VALUES ('Visit_Days', ?, ?);",
+      args: [serialized, center]
+    }
+  ], "write");
+
+  let updatedPlansCount = 0;
+  let updatedLogsCount = 0;
+
+  // 2. If specific visit days are active (1..6 days), shift all saved dates to the nearest visit day
+  if (visitDays.length > 0 && visitDays.length < 7) {
+    const updateBatch = [];
+
+    // 2a. Migrate dates inside Training_TrainingPlan.Policies (indexed by Center)
+    const planRows = await db.execute({
+      sql: "SELECT rowid, Policies FROM Training_TrainingPlan WHERE Center = ?;",
+      args: [center]
+    });
+
+    for (const row of planRows.rows) {
+      const oldPolicies = String(row.Policies || "");
+      const newPolicies = snapDatesInPoliciesString(oldPolicies, visitDays);
+      if (newPolicies !== oldPolicies) {
+        const rowId = row.rowid ?? row[0];
+        updateBatch.push({
+          sql: "UPDATE Training_TrainingPlan SET Policies = ? WHERE rowid = ? AND Center = ?;",
+          args: [newPolicies, rowId, center]
+        });
+        updatedPlansCount++;
+      }
+    }
+
+    // 2b. Migrate Date (and any embedded dates in Policies) in Training_TrainingLogs (indexed by Center)
+    const logRows = await db.execute({
+      sql: "SELECT ID, rowid, Date, Month, Year, Policies FROM Training_TrainingLogs WHERE Center = ?;",
+      args: [center]
+    });
+
+    for (const row of logRows.rows) {
+      const rawDate = String(row.Date || "").split('T')[0].trim();
+      const newDate = snapDateToNearestVisitDay(rawDate, visitDays);
+      const oldPolicies = String(row.Policies || "");
+      const newPolicies = snapDatesInPoliciesString(oldPolicies, visitDays);
+
+      if (newDate !== rawDate || newPolicies !== oldPolicies) {
+        const parsedNew = parseYmdSafe(newDate);
+        const newMonth = parsedNew ? parsedNew.month : row.Month;
+        const newYear = parsedNew ? parsedNew.year : row.Year;
+        const logId = row.ID || row.rowid;
+        updateBatch.push({
+          sql: "UPDATE Training_TrainingLogs SET Date = ?, Month = ?, Year = ?, Policies = ? WHERE (ID = ? OR rowid = ?) AND Center = ?;",
+          args: [newDate, newMonth, newYear, newPolicies, logId, logId, center]
+        });
+        updatedLogsCount++;
+      }
+    }
+
+    if (updateBatch.length > 0) {
+      const chunkSize = 500;
+      for (let i = 0; i < updateBatch.length; i += chunkSize) {
+        await db.batch(updateBatch.slice(i, i + chunkSize), "write");
+      }
+    }
+  }
+
+  invalidateCache(center);
+  invalidateCentersCache();
+
+  const freshData = await getAllDataDb({ center, forceRefresh: true });
+  return {
+    ...freshData,
+    _visitDaysUpdateSummary: {
+      visitDays,
+      updatedPlansCount,
+      updatedLogsCount
+    }
+  };
 }
 
 /**

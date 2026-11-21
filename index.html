@@ -821,6 +821,110 @@
             "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"
         ];
 
+        const ARABIC_WEEKDAYS = [
+            { id: 6, label: "السبت" },
+            { id: 0, label: "الأحد" },
+            { id: 1, label: "الاثنين" },
+            { id: 2, label: "الثلاثاء" },
+            { id: 3, label: "الأربعاء" },
+            { id: 4, label: "الخميس" },
+            { id: 5, label: "الجمعة" }
+        ];
+
+        const ARABIC_WEEKDAY_MAP = {
+            0: "الأحد",
+            1: "الاثنين",
+            2: "الثلاثاء",
+            3: "الأربعاء",
+            4: "الخميس",
+            5: "الجمعة",
+            6: "السبت"
+        };
+
+        const parseYmdSafe = (dateStr) => {
+            if (!dateStr) return null;
+            const clean = String(dateStr).split('T')[0].trim();
+            const m = clean.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (!m) return null;
+            const year = parseInt(m[1], 10);
+            const month = parseInt(m[2], 10);
+            const day = parseInt(m[3], 10);
+            if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+            return { year, month, day, clean };
+        };
+
+        const formatYmdSafe = (year, month, day) => {
+            return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        };
+
+        const getVisitDaysFromSettings = (settings = []) => {
+            if (!Array.isArray(settings)) return [];
+            const item = settings.slice().reverse().find(s => s.Type === 'Visit_Days');
+            if (!item || !item.Value) return [];
+            const set = new Set();
+            String(item.Value).split(',').forEach(part => {
+                const n = parseInt(part.trim(), 10);
+                if (!Number.isNaN(n) && n >= 0 && n <= 6) set.add(n);
+            });
+            return Array.from(set).sort((a, b) => a - b);
+        };
+
+        const getAllowedDatesInMonth = (year, month, visitDays = []) => {
+            const y = parseInt(year, 10);
+            const m = parseInt(month, 10);
+            if (!y || !m || m < 1 || m > 12) return [];
+            const restrict = Array.isArray(visitDays) && visitDays.length > 0 && visitDays.length < 7;
+            const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+            const result = [];
+            for (let d = 1; d <= daysInMonth; d++) {
+                const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+                if (restrict && !visitDays.includes(dow)) continue;
+                const dateStr = formatYmdSafe(y, m, d);
+                const weekdayName = ARABIC_WEEKDAY_MAP[dow] || "";
+                result.push({
+                    date: dateStr,
+                    day: d,
+                    weekday: dow,
+                    weekdayName,
+                    label: `${weekdayName} ${d} ${ARABIC_MONTHS[m - 1]}`
+                });
+            }
+            return result;
+        };
+
+        const snapDateToNearestVisitDay = (dateStr, visitDays = []) => {
+            const parsed = parseYmdSafe(dateStr);
+            if (!parsed) return dateStr;
+            if (!Array.isArray(visitDays) || visitDays.length === 0 || visitDays.length >= 7) {
+                return parsed.clean;
+            }
+            const { year, month, day, clean } = parsed;
+            const currentDow = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+            if (visitDays.includes(currentDow)) return clean;
+
+            const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+            let bestDay = null;
+            let bestDiff = Infinity;
+            for (let d = 1; d <= daysInMonth; d++) {
+                const dow = new Date(Date.UTC(year, month - 1, d)).getUTCDay();
+                if (!visitDays.includes(dow)) continue;
+                const diff = Math.abs(d - day);
+                if (diff < bestDiff) {
+                    bestDiff = diff;
+                    bestDay = d;
+                }
+            }
+            return bestDay !== null ? formatYmdSafe(year, month, bestDay) : clean;
+        };
+
+        const formatDateWithWeekday = (dateStr) => {
+            const parsed = parseYmdSafe(dateStr);
+            if (!parsed) return dateStr || "";
+            const dow = new Date(Date.UTC(parsed.year, parsed.month - 1, parsed.day)).getUTCDay();
+            const weekdayName = ARABIC_WEEKDAY_MAP[dow] || "";
+            return `${weekdayName} ${parsed.day} ${ARABIC_MONTHS[parsed.month - 1]}`;
+        };
+
         // --- Helper functions for policy days and calendar dates ---
         const parsePolicyDaysAndDates = (policyStr) => {
             const match = policyStr.match(/\s*\(([^)]+)\)\s*$/);
@@ -1150,6 +1254,8 @@
         const formatDatesArabic = (dates) => {
             if (!dates || dates.length === 0) return "";
             return dates.map(d => {
+                const parsed = parseYmdSafe(d);
+                if (parsed) return formatDateWithWeekday(parsed.clean);
                 const dateObj = new Date(d);
                 if (isNaN(dateObj.getTime())) return d;
                 return `${dateObj.getDate()} ${ARABIC_MONTHS[dateObj.getMonth()]}`;
@@ -4605,6 +4711,12 @@
             const currentMonth = date ? parseInt(date.split('-')[1], 10) : new Date().getMonth() + 1;
             const currentYear = date ? parseInt(date.split('-')[0], 10) : new Date().getFullYear();
             const trainers = data.settings.filter(s => s.Type === "Trainer").map(s => s.Value);
+            const visitDays = useMemo(() => getVisitDaysFromSettings(data?.settings), [data?.settings]);
+            const isVisitDaysRestricted = visitDays.length > 0 && visitDays.length < 7;
+            const allowedMonthDates = useMemo(
+                () => getAllowedDatesInMonth(currentYear, currentMonth, visitDays),
+                [currentYear, currentMonth, visitDays]
+            );
 
             const allPlannedDaysForCategory = useMemo(() => {
                 const planItem = getPlanItem(data.plan, currentMonth, category, currentYear);
@@ -4632,14 +4744,20 @@
                 return allPlannedDaysForCategory.filter(d => !recordedDates.has(d));
             }, [allPlannedDaysForCategory, data.logs, category]);
 
-            // Auto-select the first planned training date of the month when category changes
+            // Auto-select the first planned training date of the month when category changes,
+            // or snap to nearest allowed visit day if visit days filtering is enabled
             useEffect(() => {
                 if (plannedDaysForCategory.length > 0) {
                     if (!plannedDaysForCategory.includes(date)) {
                         setDate(plannedDaysForCategory[0]);
                     }
+                } else if (isVisitDaysRestricted && date) {
+                    const snapped = snapDateToNearestVisitDay(date, visitDays);
+                    if (snapped && snapped !== date) {
+                        setDate(snapped);
+                    }
                 }
-            }, [category, plannedDaysForCategory]);
+            }, [category, plannedDaysForCategory, isVisitDaysRestricted, visitDays]);
 
             const plannedPoliciesForThis = useMemo(() => {
                 const planItem = getPlanItem(data.plan, currentMonth, category, currentYear);
@@ -4781,11 +4899,7 @@
                                                         String(l.Category || "").trim() === String(category || "").trim() && 
                                                         String(l.Date || "").split('T')[0].trim() === d
                                                     );
-                                                    const dateObj = new Date(d);
-                                                    const dayNum = dateObj.getDate();
-                                                    const monthNum = dateObj.getMonth();
-                                                    const arabicMonth = ARABIC_MONTHS[monthNum];
-                                                    const label = `${dayNum} ${arabicMonth}`;
+                                                    const label = formatDateWithWeekday(d);
                                                     
                                                     return (
                                                         <button
@@ -4811,13 +4925,58 @@
                                             </div>
                                         ) : (
                                             <div className="text-[10px] text-slate-400 bg-slate-50 border border-dashed border-slate-200 p-2.5 rounded-xl text-center mb-2">
-                                                لا توجد أيام تدريب محددة في الخطة لهذا الشهر. يمكنك اختيار تاريخ يدوي أدناه.
+                                                لا توجد أيام تدريب محددة في الخطة لهذا الشهر. يمكنك اختيار تاريخ من أيام التدريب أدناه.
                                             </div>
                                         )}
                                     </div>
                                     <div>
-                                        <label className="block text-xs font-bold text-slate-400 mb-1">تاريخ التدريب</label>
-                                        <input type="date" value={date} onChange={e => setDate(e.target.value)} className="input-base text-sm lg:text-base cursor-pointer hover:border-indigo-200" />
+                                        {isVisitDaysRestricted ? (
+                                            <div className="space-y-2.5">
+                                                <div className="flex items-center justify-between">
+                                                    <label className="block text-xs font-bold text-slate-500">تاريخ التدريب (أيام التدريب فقط)</label>
+                                                    <span className="text-[10px] font-bold text-sky-700 bg-sky-50 border border-sky-200/70 px-2 py-0.5 rounded-lg tabular-nums">
+                                                        {allowedMonthDates.length} أيام في {ARABIC_MONTHS[currentMonth - 1]}
+                                                    </span>
+                                                </div>
+                                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                                    <input
+                                                        type="month"
+                                                        value={`${currentYear}-${String(currentMonth).padStart(2, '0')}`}
+                                                        onChange={e => {
+                                                            if (!e.target.value) return;
+                                                            const [y, m] = e.target.value.split('-').map(Number);
+                                                            const nextAllowed = getAllowedDatesInMonth(y, m, visitDays);
+                                                            if (nextAllowed.length > 0) {
+                                                                setDate(nextAllowed[0].date);
+                                                            } else {
+                                                                setDate(formatYmdSafe(y, m, 1));
+                                                            }
+                                                        }}
+                                                        className="input-base text-xs font-bold cursor-pointer hover:border-sky-300 py-2"
+                                                        title="تغيير الشهر والسنة"
+                                                    />
+                                                    <select
+                                                        value={date}
+                                                        onChange={e => setDate(e.target.value)}
+                                                        className="input-base text-xs lg:text-sm font-bold cursor-pointer hover:border-sky-300 bg-white py-2"
+                                                    >
+                                                        {!allowedMonthDates.some(item => item.date === date) && date && (
+                                                            <option value={date}>{formatDateWithWeekday(date)} ({date})</option>
+                                                        )}
+                                                        {allowedMonthDates.map(item => (
+                                                            <option key={item.date} value={item.date}>
+                                                                {item.label}
+                                                            </option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <>
+                                                <label className="block text-xs font-bold text-slate-400 mb-1">تاريخ التدريب</label>
+                                                <input type="date" value={date} onChange={e => setDate(e.target.value)} className="input-base text-sm lg:text-base cursor-pointer hover:border-indigo-200" />
+                                            </>
+                                        )}
                                     </div>
                                     <div>
                                         <label className="block text-xs font-bold text-slate-400 mb-1">القائم بالتدريب</label>
@@ -6131,6 +6290,13 @@
                 return data.settings.filter(s => s.Type === "Policy").map(p => p.Value);
             }, [data.settings]);
 
+            const visitDays = useMemo(() => getVisitDaysFromSettings(data?.settings), [data?.settings]);
+            const isVisitDaysRestricted = visitDays.length > 0 && visitDays.length < 7;
+            const allowedMonthDates = useMemo(
+                () => getAllowedDatesInMonth(selectedYear, selectedMonth, visitDays),
+                [selectedYear, selectedMonth, visitDays]
+            );
+
             const startEditing = (cat, currentPoliciesStr) => {
                 setEditingCategory(cat);
                 const list = splitPolicies(currentPoliciesStr);
@@ -6245,7 +6411,14 @@
                                     {isEditingThis ? (
                                         /* Interactive Edit Interface */
                                         <div className="space-y-4 animate-in fade-in duration-200">
-                                            <div className="text-xs font-bold text-indigo-600 border-b pb-2">تعديل مواضيع الخطة والمدة التدريبية:</div>
+                                            <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-bold text-indigo-600 border-b pb-2">
+                                                <span>تعديل مواضيع الخطة والمدة التدريبية:</span>
+                                                {isVisitDaysRestricted && (
+                                                    <span className="text-[11px] font-bold text-sky-700 bg-sky-50 border border-sky-200/80 px-2.5 py-0.5 rounded-lg tabular-nums">
+                                                        أيام التدريب: {visitDays.map(d => ARABIC_WEEKDAY_MAP[d]).join('، ')} ({allowedMonthDates.length} أيام)
+                                                    </span>
+                                                )}
+                                            </div>
                                             
                                             <div className="space-y-3 max-h-96 overflow-y-auto pr-1">
                                                 {editingPolicies.map((p, idx) => {
@@ -6308,36 +6481,45 @@
                                                             {days > 0 && (
                                                                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 bg-white p-2 rounded-lg border border-slate-100 mt-1">
                                                                     <div>
-                                                                        <label className="block text-[10px] font-bold text-slate-400 mb-1">تاريخ اليوم الأول</label>
-                                                                        <input 
-                                                                            type="date" 
-                                                                            value={dates[0] || ""} 
-                                                                            onChange={(e) => {
-                                                                                const val = e.target.value;
-                                                                                setEditingPolicies(prev => prev.map((item, i) => {
-                                                                                    if (i === idx) {
-                                                                                        const newDates = [...(item.dates || [])];
-                                                                                        newDates[0] = val;
-                                                                                        return { ...item, dates: newDates };
-                                                                                    }
-                                                                                    return item;
-                                                                                }));
-                                                                            }}
-                                                                            className="input-base text-xs font-bold py-1 px-2 w-full cursor-pointer hover:border-indigo-200" 
-                                                                        />
-                                                                    </div>
-                                                                    {days === 2 && (
-                                                                        <div>
-                                                                            <label className="block text-[10px] font-bold text-slate-400 mb-1">تاريخ اليوم الثاني</label>
-                                                                            <input 
-                                                                                type="date" 
-                                                                                value={dates[1] || ""} 
+                                                                        <label className="block text-[10px] font-bold text-slate-400 mb-1">
+                                                                            تاريخ اليوم الأول {isVisitDaysRestricted ? "(أيام التدريب فقط)" : ""}
+                                                                        </label>
+                                                                        {isVisitDaysRestricted ? (
+                                                                            <select
+                                                                                value={dates[0] || ""}
                                                                                 onChange={(e) => {
                                                                                     const val = e.target.value;
                                                                                     setEditingPolicies(prev => prev.map((item, i) => {
                                                                                         if (i === idx) {
                                                                                             const newDates = [...(item.dates || [])];
-                                                                                            newDates[1] = val;
+                                                                                            newDates[0] = val;
+                                                                                            return { ...item, dates: newDates };
+                                                                                        }
+                                                                                        return item;
+                                                                                    }));
+                                                                                }}
+                                                                                className="input-base text-xs font-bold py-1.5 px-2 w-full cursor-pointer hover:border-sky-300 bg-white"
+                                                                            >
+                                                                                <option value="">-- اختر يوم التدريب --</option>
+                                                                                {dates[0] && !allowedMonthDates.some(item => item.date === dates[0]) && (
+                                                                                    <option value={dates[0]}>{formatDateWithWeekday(dates[0])} ({dates[0]})</option>
+                                                                                )}
+                                                                                {allowedMonthDates.map(item => (
+                                                                                    <option key={item.date} value={item.date}>
+                                                                                        {item.label} ({item.date})
+                                                                                    </option>
+                                                                                ))}
+                                                                            </select>
+                                                                        ) : (
+                                                                            <input 
+                                                                                type="date" 
+                                                                                value={dates[0] || ""} 
+                                                                                onChange={(e) => {
+                                                                                    const val = e.target.value;
+                                                                                    setEditingPolicies(prev => prev.map((item, i) => {
+                                                                                        if (i === idx) {
+                                                                                            const newDates = [...(item.dates || [])];
+                                                                                            newDates[0] = val;
                                                                                             return { ...item, dates: newDates };
                                                                                         }
                                                                                         return item;
@@ -6345,6 +6527,57 @@
                                                                                 }}
                                                                                 className="input-base text-xs font-bold py-1 px-2 w-full cursor-pointer hover:border-indigo-200" 
                                                                             />
+                                                                        )}
+                                                                    </div>
+                                                                    {days === 2 && (
+                                                                        <div>
+                                                                            <label className="block text-[10px] font-bold text-slate-400 mb-1">
+                                                                                تاريخ اليوم الثاني {isVisitDaysRestricted ? "(أيام التدريب فقط)" : ""}
+                                                                            </label>
+                                                                            {isVisitDaysRestricted ? (
+                                                                                <select
+                                                                                    value={dates[1] || ""}
+                                                                                    onChange={(e) => {
+                                                                                        const val = e.target.value;
+                                                                                        setEditingPolicies(prev => prev.map((item, i) => {
+                                                                                            if (i === idx) {
+                                                                                                const newDates = [...(item.dates || [])];
+                                                                                                newDates[1] = val;
+                                                                                                return { ...item, dates: newDates };
+                                                                                            }
+                                                                                            return item;
+                                                                                        }));
+                                                                                    }}
+                                                                                    className="input-base text-xs font-bold py-1.5 px-2 w-full cursor-pointer hover:border-sky-300 bg-white"
+                                                                                >
+                                                                                    <option value="">-- اختر يوم التدريب --</option>
+                                                                                    {dates[1] && !allowedMonthDates.some(item => item.date === dates[1]) && (
+                                                                                        <option value={dates[1]}>{formatDateWithWeekday(dates[1])} ({dates[1]})</option>
+                                                                                    )}
+                                                                                    {allowedMonthDates.map(item => (
+                                                                                        <option key={item.date} value={item.date}>
+                                                                                            {item.label} ({item.date})
+                                                                                        </option>
+                                                                                    ))}
+                                                                                </select>
+                                                                            ) : (
+                                                                                <input 
+                                                                                    type="date" 
+                                                                                    value={dates[1] || ""} 
+                                                                                    onChange={(e) => {
+                                                                                        const val = e.target.value;
+                                                                                        setEditingPolicies(prev => prev.map((item, i) => {
+                                                                                            if (i === idx) {
+                                                                                                const newDates = [...(item.dates || [])];
+                                                                                                newDates[1] = val;
+                                                                                                return { ...item, dates: newDates };
+                                                                                            }
+                                                                                            return item;
+                                                                                        }));
+                                                                                    }}
+                                                                                    className="input-base text-xs font-bold py-1 px-2 w-full cursor-pointer hover:border-indigo-200" 
+                                                                                />
+                                                                            )}
                                                                         </div>
                                                                     )}
                                                                 </div>
@@ -7022,6 +7255,8 @@
             const [icManagerName, setIcManagerName] = useState(getSetting('IC_Manager_Name', 'د/ محمود رمضان عبدالسميع'));
             const [hospitalManagerTitle, setHospitalManagerTitle] = useState(getSetting('Hospital_Manager_Title', 'مدير عام المستشفى'));
             const [hospitalManagerName, setHospitalManagerName] = useState(getSetting('Hospital_Manager_Name', 'أ.د/ أحمد عبدالحميد'));
+            const [selectedVisitDays, setSelectedVisitDays] = useState(() => getVisitDaysFromSettings(data?.settings));
+            const [isSavingVisitDays, setIsSavingVisitDays] = useState(false);
 
             useEffect(() => {
                 setHospitalNameInput(getSetting('Hospital_Name', currentCenter || 'مستشفى المنيا الجامعى للعيون'));
@@ -7031,6 +7266,7 @@
                 setIcManagerName(getSetting('IC_Manager_Name', 'د/ محمود رمضان عبدالسميع'));
                 setHospitalManagerTitle(getSetting('Hospital_Manager_Title', 'مدير عام المستشفى'));
                 setHospitalManagerName(getSetting('Hospital_Manager_Name', 'أ.د/ أحمد عبدالحميد'));
+                setSelectedVisitDays(getVisitDaysFromSettings(data?.settings));
             }, [data?.settings, currentCenter]);
 
             useEffect(() => {
@@ -7304,6 +7540,51 @@
                 finally { setIsProcessing(false); }
             };
 
+            const toggleVisitDay = (dayId) => {
+                setSelectedVisitDays(prev => (
+                    prev.includes(dayId)
+                        ? prev.filter(id => id !== dayId)
+                        : [...prev, dayId].sort((a, b) => a - b)
+                ));
+            };
+
+            const currentMonthPreviewDates = useMemo(() => {
+                const now = new Date();
+                return getAllowedDatesInMonth(now.getFullYear(), now.getMonth() + 1, selectedVisitDays);
+            }, [selectedVisitDays]);
+
+            const handleSaveVisitDays = async (overrideDays = null) => {
+                const daysToSave = Array.isArray(overrideDays) ? overrideDays : selectedVisitDays;
+                setIsSavingVisitDays(true);
+                try {
+                    const res = await runServer('saveVisitDays', daysToSave);
+                    const summary = res?._visitDaysUpdateSummary;
+                    if (res && res._visitDaysUpdateSummary) {
+                        const cleanRes = { ...res };
+                        delete cleanRes._visitDaysUpdateSummary;
+                        refreshData(cleanRes);
+                    } else {
+                        refreshData(res);
+                    }
+                    setSelectedVisitDays(daysToSave);
+
+                    if (daysToSave.length === 0 || daysToSave.length === 7) {
+                        showToast("تم حفظ الإعداد — جميع أيام الشهر متاحة الآن");
+                    } else if (summary && (summary.updatedPlansCount > 0 || summary.updatedLogsCount > 0)) {
+                        const parts = [];
+                        if (summary.updatedPlansCount > 0) parts.push(`${summary.updatedPlansCount} بند خطة`);
+                        if (summary.updatedLogsCount > 0) parts.push(`${summary.updatedLogsCount} سجل تدريب`);
+                        showToast(`تم حفظ أيام التدريب وتحديث ${parts.join(' و ')} إلى أقرب يوم تدريب`);
+                    } else {
+                        showToast("تم حفظ أيام التدريب بنجاح (جميع التواريخ المحفوظة مطابقة بالفعل)");
+                    }
+                } catch (e) {
+                    showToast(e.message || "حدث خطأ أثناء حفظ أيام التدريب", "error");
+                } finally {
+                    setIsSavingVisitDays(false);
+                }
+            };
+
             const effectiveCenters = (centers && centers.length > 0) ? centers : (data?.centers || []);
             const activeCenterName = currentCenter || data?.currentCenter || hospitalName;
 
@@ -7571,6 +7852,102 @@
                                     <button onClick={handleUpdateHospitalName} disabled={isProcessing} className="btn-primary whitespace-nowrap bg-indigo-600 hover:bg-indigo-700">
                                         {isProcessing ? <Icons.Loading /> : "حفظ التعديل"}
                                     </button>
+                                </div>
+                            </div>
+
+                            {/* Training Days (أيام التدريب الأسبوعية) Card */}
+                            <div className="card p-6 lg:p-8 space-y-5 md:col-span-2 border-sky-200/80 bg-gradient-to-l from-white via-sky-50/45 to-white">
+                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-3">
+                                    <div>
+                                        <h4 className="font-bold text-slate-800 flex items-center gap-2 text-base lg:text-lg">
+                                            <Icons.Plan />
+                                            <span>أيام التدريب الأسبوعية (تصفية أيام الشهر)</span>
+                                        </h4>
+                                        <p className="text-xs text-slate-500 mt-1">
+                                            حدد أيام التدريب المطلوبة لتظهر هذه الأيام فقط من كل شهر عند إعداد الخطة السنوية أو تسجيل التدريب.
+                                        </p>
+                                    </div>
+                                    <span className="text-xs font-bold text-sky-700 bg-sky-50 border border-sky-200/80 px-3 py-1.5 rounded-xl self-start sm:self-auto whitespace-nowrap tabular-nums">
+                                        {selectedVisitDays.length > 0 && selectedVisitDays.length < 7
+                                            ? `محدد ${selectedVisitDays.length} يوم · ${currentMonthPreviewDates.length} أيام هذا الشهر`
+                                            : "كل أيام الشهر متاحة"}
+                                    </span>
+                                </div>
+
+                                <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2.5">
+                                    {ARABIC_WEEKDAYS.map(day => {
+                                        const isChecked = selectedVisitDays.includes(day.id);
+                                        return (
+                                            <label
+                                                key={day.id}
+                                                className={`cursor-pointer select-none rounded-xl border p-3 flex items-center justify-center gap-2 transition-all duration-200 font-bold text-sm ${
+                                                    isChecked
+                                                        ? 'bg-sky-50 border-sky-400 text-sky-800 shadow-sm ring-2 ring-sky-200/70'
+                                                        : 'bg-white/90 border-slate-200 text-slate-600 hover:border-sky-200 hover:bg-sky-50/30'
+                                                }`}
+                                            >
+                                                <input
+                                                    type="checkbox"
+                                                    checked={isChecked}
+                                                    onChange={() => toggleVisitDay(day.id)}
+                                                    className="w-4 h-4 rounded accent-sky-600 cursor-pointer shrink-0"
+                                                />
+                                                <span>{day.label}</span>
+                                            </label>
+                                        );
+                                    })}
+                                </div>
+
+                                {/* Live Preview of Matching Days in Current Month */}
+                                <div className="bg-white/90 border border-slate-200/80 rounded-xl p-3.5 space-y-2">
+                                    <div className="flex items-center justify-between text-xs font-bold text-slate-600">
+                                        <span>
+                                            الأيام التي ستظهر في شهر {ARABIC_MONTHS[new Date().getMonth()]} {new Date().getFullYear()}:
+                                        </span>
+                                        <span className="text-sky-700 tabular-nums">{currentMonthPreviewDates.length} يوم</span>
+                                    </div>
+                                    {selectedVisitDays.length > 0 && selectedVisitDays.length < 7 ? (
+                                        <div className="flex flex-wrap gap-1.5">
+                                            {currentMonthPreviewDates.map(item => (
+                                                <span
+                                                    key={item.date}
+                                                    className="px-2.5 py-1 rounded-lg bg-sky-50/90 border border-sky-200/70 text-sky-800 text-[11px] font-bold tabular-nums"
+                                                >
+                                                    {item.label}
+                                                </span>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <p className="text-xs text-slate-500">
+                                            لم يتم تقييد أيام محددة — ستظهر جميع أيام الشهر (1 إلى {currentMonthPreviewDates.length}).
+                                        </p>
+                                    )}
+                                </div>
+
+                                <div className="bg-sky-50/70 border border-sky-200/70 rounded-xl p-3 text-xs text-sky-900 leading-relaxed">
+                                    <strong>ملاحظة التحديث التلقائي:</strong> عند تعديل وحفظ أيام التدريب، يتم تغيير جميع التواريخ المحفوظة مسبقاً (في الخطة السنوية وسجلات التدريب لهذا المركز) تلقائياً إلى <strong>أقرب يوم تدريب محدد</strong> من اليوم المحفوظ داخل نفس الشهر.
+                                </div>
+
+                                <div className="flex flex-col sm:flex-row gap-2.5">
+                                    <button
+                                        type="button"
+                                        onClick={() => handleSaveVisitDays()}
+                                        disabled={isSavingVisitDays}
+                                        className="btn-primary flex-1 text-xs lg:text-sm py-2.5"
+                                    >
+                                        {isSavingVisitDays ? <Icons.Loading /> : <Icons.Check />}
+                                        <span>{isSavingVisitDays ? "جاري الحفظ وتحديث التواريخ..." : "حفظ أيام التدريب وتحديث التواريخ المحفوظة"}</span>
+                                    </button>
+                                    {selectedVisitDays.length > 0 && (
+                                        <button
+                                            type="button"
+                                            onClick={() => handleSaveVisitDays([])}
+                                            disabled={isSavingVisitDays}
+                                            className="btn-secondary text-xs lg:text-sm py-2.5 px-4"
+                                        >
+                                            إظهار كل أيام الشهر
+                                        </button>
+                                    )}
                                 </div>
                             </div>
                             {/* Dual Logos Management Card */}
