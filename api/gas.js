@@ -13,6 +13,7 @@ import {
   saveImportedPlanDb,
   updateSessionTrainerDb,
   updateSessionPoliciesDb,
+  updateSessionDateDb,
   deleteTrainingSessionDb,
   addTraineesToSessionDb,
   testPreviousTursoDb,
@@ -95,6 +96,8 @@ export default async function handler(req, res) {
       result = await updateSessionTrainerDb(args[0], activeCenter);
     } else if (func === 'updateSessionPolicies') {
       result = await updateSessionPoliciesDb(args[0], activeCenter);
+    } else if (func === 'updateSessionDate') {
+      result = await updateSessionDateDb(args[0], activeCenter);
     } else if (func === 'deleteTrainingSession') {
       result = await deleteTrainingSessionDb(args[0], activeCenter);
     } else {

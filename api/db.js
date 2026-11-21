@@ -1053,6 +1053,82 @@ export async function updateSessionPoliciesDb(payload = {}, centerArg = "") {
 }
 
 /**
+ * Updates the date (and corresponding month & year) for an entire saved training session within a center
+ */
+export async function updateSessionDateDb(payload = {}, centerArg = "") {
+  await createTablesAndMigrate();
+  const { oldDate, newDate, category, policies, trainer, logIds } = payload;
+  const center = String(payload.center || centerArg || "").trim() || await getDefaultCenterDb();
+
+  const parsedNew = parseYmdSafe(newDate);
+  if (!parsedNew) {
+    throw new Error("يرجى اختيار تاريخ صحيح للجلسة");
+  }
+
+  const cleanNewDate = parsedNew.clean;
+  const newMonth = parsedNew.month;
+  const newYear = parsedNew.year;
+
+  const cleanOldDate = oldDate ? String(oldDate).split('T')[0].trim() : "";
+  const cleanCat = category ? String(category).trim() : "";
+  const cleanPol = policies ? String(policies).trim() : "";
+  const cleanTrainer = trainer ? String(trainer).trim() : "";
+
+  // 1. Update by specific Log IDs if provided (uses PRIMARY KEY)
+  if (Array.isArray(logIds) && logIds.length > 0) {
+    const validIds = logIds.filter(Boolean);
+    for (let i = 0; i < validIds.length; i += 50) {
+      const chunk = validIds.slice(i, i + 50);
+      const placeholders = chunk.map(() => '?').join(',');
+      await db.execute({
+        sql: `UPDATE Training_TrainingLogs SET Date = ?, Month = ?, Year = ? WHERE ID IN (${placeholders}) AND Center = ?`,
+        args: [cleanNewDate, newMonth, newYear, ...chunk, center]
+      });
+    }
+  }
+
+  // 2. Also update by composite session match (uses idx_logs_center_cat)
+  if (cleanOldDate && cleanCat && cleanPol) {
+    let sql = `UPDATE Training_TrainingLogs
+               SET Date = ?, Month = ?, Year = ?
+               WHERE Center = ?
+                 AND Category = ?
+                 AND Policies = ?
+                 AND (Date = ? OR Date LIKE ?)`;
+    const args = [cleanNewDate, newMonth, newYear, center, cleanCat, cleanPol, cleanOldDate, `${cleanOldDate}%`];
+    if (cleanTrainer) {
+      sql += ` AND Trainer = ?`;
+      args.push(cleanTrainer);
+    }
+    await db.execute({ sql, args });
+  }
+
+  invalidateCentersCache();
+
+  if (inMemoryCache[center]?.data) {
+    const validIdsSet = new Set(Array.isArray(logIds) ? logIds.filter(Boolean).map(String) : []);
+    inMemoryCache[center].data.logs.forEach(l => {
+      const matchesId = validIdsSet.size > 0 && validIdsSet.has(String(l.ID));
+      const lDate = String(l.Date || "").split('T')[0].trim();
+      const matchesComp = cleanOldDate && cleanCat && cleanPol &&
+        lDate === cleanOldDate &&
+        String(l.Category || "").trim() === cleanCat &&
+        String(l.Policies || "").trim() === cleanPol &&
+        (!cleanTrainer || String(l.Trainer || "").trim() === cleanTrainer);
+      if (matchesId || matchesComp) {
+        l.Date = cleanNewDate;
+        l.Month = newMonth;
+        l.Year = newYear;
+      }
+    });
+    inMemoryCache[center].expiresAt = Date.now() + CACHE_TTL_MS;
+    return inMemoryCache[center].data;
+  }
+
+  return getAllDataDb({ center, forceRefresh: true });
+}
+
+/**
  * Deletes an entire training session or a single trainee record within a center
  */
 export async function deleteTrainingSessionDb(payload = {}, centerArg = "") {

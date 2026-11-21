@@ -2630,6 +2630,85 @@
                 }
             };
 
+            // Date editing for saved training session
+            const visitDays = useMemo(() => getVisitDaysFromSettings(data?.settings), [data?.settings]);
+            const isVisitDaysRestricted = visitDays.length > 0 && visitDays.length < 7;
+            const [editingDateSession, setEditingDateSession] = useState(null);
+            const [selectedNewDate, setSelectedNewDate] = useState("");
+            const [allowManualAnyDate, setAllowManualAnyDate] = useState(false);
+            const [isUpdatingDate, setIsUpdatingDate] = useState(false);
+
+            const editDateParsed = useMemo(() => parseYmdSafe(selectedNewDate), [selectedNewDate]);
+            const editDateYear = editDateParsed ? editDateParsed.year : new Date().getFullYear();
+            const editDateMonth = editDateParsed ? editDateParsed.month : (new Date().getMonth() + 1);
+            const editDateAllowedMonthDates = useMemo(
+                () => getAllowedDatesInMonth(editDateYear, editDateMonth, visitDays),
+                [editDateYear, editDateMonth, visitDays]
+            );
+
+            const openEditDateModal = (log) => {
+                const logDateStr = String(log.Date || "").split('T')[0].trim();
+                const logCat = String(log.Category || "").trim();
+                const logPol = String(log.Policies || "").trim();
+                const logTr = String(log.Trainer || "").trim();
+
+                const sessionLogs = (data.logs || []).filter(item => {
+                    const itemDateStr = String(item.Date || "").split('T')[0].trim();
+                    const itemCat = String(item.Category || "").trim();
+                    const itemPol = String(item.Policies || "").trim();
+                    const itemTr = String(item.Trainer || "").trim();
+                    return itemDateStr === logDateStr && itemCat === logCat && itemPol === logPol && itemTr === logTr;
+                });
+
+                const traineeNames = sessionLogs.map(s => s.TraineeName).filter(Boolean);
+                const logIds = sessionLogs.map(s => s.ID).filter(Boolean);
+
+                setEditingDateSession({
+                    date: logDateStr,
+                    category: log.Category,
+                    policies: log.Policies,
+                    trainer: log.Trainer,
+                    traineeNames,
+                    logIds
+                });
+                setSelectedNewDate(logDateStr);
+                setAllowManualAnyDate(false);
+            };
+
+            const handleSaveDateUpdate = async () => {
+                if (!editingDateSession) return;
+                const cleanNewDate = String(selectedNewDate || "").split('T')[0].trim();
+                if (!parseYmdSafe(cleanNewDate)) {
+                    showToast("يرجى اختيار تاريخ صحيح للجلسة", "error");
+                    return;
+                }
+                if (cleanNewDate === editingDateSession.date) {
+                    showToast("التاريخ المختار هو نفس التاريخ الحالي للجلسة. يرجى اختيار تاريخ آخر", "warning");
+                    return;
+                }
+
+                setIsUpdatingDate(true);
+                try {
+                    const res = await runServer('updateSessionDate', {
+                        oldDate: editingDateSession.date,
+                        newDate: cleanNewDate,
+                        category: editingDateSession.category,
+                        policies: editingDateSession.policies,
+                        trainer: editingDateSession.trainer,
+                        logIds: editingDateSession.logIds
+                    });
+                    if (refreshData) {
+                        refreshData(res);
+                    }
+                    showToast(`تم تعديل تاريخ الجلسة بنجاح إلى "${formatDateWithWeekday(cleanNewDate)}" لجميع المتدربين (${editingDateSession.traineeNames.length} متدرب)`, "success");
+                    setEditingDateSession(null);
+                } catch (err) {
+                    showToast(err.message || "حدث خطأ أثناء تعديل تاريخ الجلسة", "error");
+                } finally {
+                    setIsUpdatingDate(false);
+                }
+            };
+
             // Policy editing for training session
             const [editingPoliciesSession, setEditingPoliciesSession] = useState(null);
             const [selectedPoliciesList, setSelectedPoliciesList] = useState([]);
@@ -3395,10 +3474,23 @@
                                                          }
                                                      }}
                                                      title="إضافة متدربين جدد لهذه الجلسة المحفوظة"
-                                                     className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-bold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 transition-colors border border-emerald-200 shadow-2xs"
+                                                     className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-bold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 transition-colors border border-emerald-200 shadow-sm"
                                                  >
                                                      <Icons.UserPlus />
                                                      <span>إضافة متدربين</span>
+                                                 </button>
+                                                 <button 
+                                                     type="button"
+                                                     onClick={() => {
+                                                         if (group.records && group.records[0]) {
+                                                             openEditDateModal(group.records[0]);
+                                                         }
+                                                     }}
+                                                     title="تعديل تاريخ هذه الجلسة لكافة المتدربين"
+                                                     className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-bold text-sky-700 bg-sky-50 hover:bg-sky-100 transition-colors border border-sky-200 shadow-sm"
+                                                 >
+                                                     <Icons.Edit />
+                                                     <span>تعديل التاريخ</span>
                                                  </button>
                                                  <button 
                                                      type="button"
@@ -3523,7 +3615,20 @@
                                         {filteredLogs.map((l, i) => (
                                             <tr key={i} className="group hover:bg-indigo-50/40 transition-colors duration-150 cursor-default">
                                                 <td className="px-4 lg:px-6 py-3 lg:py-4 text-xs lg:text-sm text-slate-500 font-medium whitespace-nowrap">
-                                                    {formatLogDate(l.Date)}
+                                                    <div className="flex items-center gap-1.5">
+                                                        <span className="tabular-nums">{formatLogDate(l.Date)}</span>
+                                                        <button
+                                                            type="button"
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                openEditDateModal(l);
+                                                            }}
+                                                            title="تعديل تاريخ هذه الجلسة لكافة المتدربين"
+                                                            className="p-1 rounded-md text-slate-400 hover:text-sky-600 hover:bg-sky-50 transition-colors border border-transparent hover:border-sky-100 shrink-0"
+                                                        >
+                                                            <Icons.Edit />
+                                                        </button>
+                                                    </div>
                                                 </td>
                                                 <td className="px-4 lg:px-6 py-3 lg:py-4">
                                                     <div className="font-bold text-slate-800 text-sm lg:text-base group-hover:text-indigo-700 transition-colors">{l.TraineeName}</div>
@@ -3872,6 +3977,166 @@
                                             <>
                                                 <Icons.Check />
                                                 <span>حفظ وتحديث المدرب</span>
+                                            </>
+                                        )}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Modal for Editing Session Date */}
+                    {editingDateSession && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/55 backdrop-blur-sm fade-in no-print overflow-y-auto" onClick={() => !isUpdatingDate && setEditingDateSession(null)}>
+                            <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-100 slide-up space-y-4 text-right" dir="rtl" onClick={e => e.stopPropagation()}>
+                                <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+                                    <div className="flex items-center gap-2.5">
+                                        <div className="w-10 h-10 rounded-xl bg-sky-50 text-sky-600 flex items-center justify-center shrink-0 border border-sky-100">
+                                            <Icons.Plan />
+                                        </div>
+                                        <div>
+                                            <h3 className="font-bold text-slate-800 text-base lg:text-lg">تعديل تاريخ الجلسة المحفوظة</h3>
+                                            <p className="text-xs text-slate-400">تحديث تاريخ الجلسة لجميع المتدربين المسجلين بها</p>
+                                        </div>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        disabled={isUpdatingDate}
+                                        onClick={() => setEditingDateSession(null)}
+                                        className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors"
+                                    >
+                                        ✕
+                                    </button>
+                                </div>
+
+                                {/* Session Summary Card */}
+                                <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3.5 space-y-2 text-xs">
+                                    <div className="flex justify-between items-center py-0.5">
+                                        <span className="text-slate-500 font-medium">التاريخ الحالي:</span>
+                                        <span className="font-bold text-sky-800 bg-sky-50 px-2.5 py-0.5 rounded-lg border border-sky-200 tabular-nums">
+                                            {formatDateWithWeekday(editingDateSession.date)} ({editingDateSession.date})
+                                        </span>
+                                    </div>
+                                    <div className="flex justify-between items-center py-0.5">
+                                        <span className="text-slate-500 font-medium">الفئة المستهدفة:</span>
+                                        <span className="font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-100">{editingDateSession.category}</span>
+                                    </div>
+                                    <div className="flex justify-between items-start py-0.5 gap-2">
+                                        <span className="text-slate-500 font-medium shrink-0">السياسات:</span>
+                                        <span className="font-bold text-slate-800 text-left">{editingDateSession.policies}</span>
+                                    </div>
+                                    <div className="flex justify-between items-center py-0.5 border-t border-slate-200/70 pt-1.5">
+                                        <span className="text-slate-500 font-medium">عدد المتدربين في الجلسة:</span>
+                                        <span className="font-bold text-emerald-700 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-200 tabular-nums">{editingDateSession.traineeNames.length} متدرب</span>
+                                    </div>
+                                </div>
+
+                                <div className="bg-sky-50/80 border border-sky-200/70 text-sky-900 p-3 rounded-xl text-xs leading-relaxed">
+                                    سيتم تحديث تاريخ الجلسة (والشهر والسنة تلقائياً) لجميع المتدربين في هذا الكشف ({editingDateSession.traineeNames.length} متدرب) فور الضغط على حفظ.
+                                </div>
+
+                                {/* Date Selection Controls */}
+                                <div className="space-y-3">
+                                    {isVisitDaysRestricted && !allowManualAnyDate ? (
+                                        <div className="space-y-2.5">
+                                            <div className="flex items-center justify-between">
+                                                <label className="text-xs font-bold text-slate-700">التاريخ الجديد (أيام التدريب فقط):</label>
+                                                <span className="text-[10px] font-bold text-sky-700 bg-sky-50 border border-sky-200/70 px-2 py-0.5 rounded-lg tabular-nums">
+                                                    {editDateAllowedMonthDates.length} أيام في {ARABIC_MONTHS[editDateMonth - 1]} {editDateYear}
+                                                </span>
+                                            </div>
+                                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                                <div>
+                                                    <label className="block text-[10px] font-bold text-slate-400 mb-1">الشهر والسنة</label>
+                                                    <input
+                                                        type="month"
+                                                        value={`${editDateYear}-${String(editDateMonth).padStart(2, '0')}`}
+                                                        onChange={e => {
+                                                            if (!e.target.value) return;
+                                                            const [y, m] = e.target.value.split('-').map(Number);
+                                                            const nextAllowed = getAllowedDatesInMonth(y, m, visitDays);
+                                                            if (nextAllowed.length > 0) {
+                                                                setSelectedNewDate(nextAllowed[0].date);
+                                                            } else {
+                                                                setSelectedNewDate(formatYmdSafe(y, m, 1));
+                                                            }
+                                                        }}
+                                                        className="input-base text-xs font-bold cursor-pointer py-2"
+                                                    />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-[10px] font-bold text-slate-400 mb-1">يوم التدريب</label>
+                                                    <select
+                                                        value={selectedNewDate}
+                                                        onChange={e => setSelectedNewDate(e.target.value)}
+                                                        className="input-base text-xs font-bold bg-white cursor-pointer py-2"
+                                                    >
+                                                        {selectedNewDate && !editDateAllowedMonthDates.some(item => item.date === selectedNewDate) && (
+                                                            <option value={selectedNewDate}>{formatDateWithWeekday(selectedNewDate)} ({selectedNewDate})</option>
+                                                        )}
+                                                        {editDateAllowedMonthDates.map(item => (
+                                                            <option key={item.date} value={item.date}>
+                                                                {item.label} ({item.date})
+                                                            </option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <div className="space-y-1.5">
+                                            <label className="block text-xs font-bold text-slate-700">اختر التاريخ الجديد للجلسة:</label>
+                                            <input
+                                                type="date"
+                                                value={selectedNewDate}
+                                                onChange={e => setSelectedNewDate(e.target.value)}
+                                                className="input-base text-sm font-bold cursor-pointer"
+                                            />
+                                            {selectedNewDate && parseYmdSafe(selectedNewDate) && (
+                                                <p className="text-[11px] font-bold text-sky-700">
+                                                    اليوم المختار: {formatDateWithWeekday(selectedNewDate)}
+                                                </p>
+                                            )}
+                                        </div>
+                                    )}
+
+                                    {isVisitDaysRestricted && (
+                                        <label className="inline-flex items-center gap-2 text-xs text-slate-500 font-semibold cursor-pointer select-none pt-1">
+                                            <input
+                                                type="checkbox"
+                                                checked={allowManualAnyDate}
+                                                onChange={e => setAllowManualAnyDate(e.target.checked)}
+                                                className="w-3.5 h-3.5 rounded accent-sky-600 cursor-pointer"
+                                            />
+                                            <span>اختيار تاريخ يدوي خارج أيام التدريب المحددة</span>
+                                        </label>
+                                    )}
+                                </div>
+
+                                <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
+                                    <button
+                                        type="button"
+                                        disabled={isUpdatingDate}
+                                        onClick={() => setEditingDateSession(null)}
+                                        className="btn-secondary py-2 px-4 text-xs"
+                                    >
+                                        إلغاء
+                                    </button>
+                                    <button
+                                        type="button"
+                                        disabled={isUpdatingDate || !selectedNewDate}
+                                        onClick={handleSaveDateUpdate}
+                                        className="btn-primary py-2 px-5 text-xs"
+                                    >
+                                        {isUpdatingDate ? (
+                                            <>
+                                                <Icons.Loading />
+                                                <span>جاري التحديث...</span>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <Icons.Check />
+                                                <span>حفظ وتحديث التاريخ</span>
                                             </>
                                         )}
                                     </button>
